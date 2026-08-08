@@ -1076,3 +1076,45 @@ Qwen3.6 full-attn head_dim=256（=2× Gemma4 128 的 score 成本）、kv_heads=
 
 ### 結論
 DeltaNet 對 batched verify 的加速**不是「每 token 便宜 2-3×」**（短 ctx 反而貴），而是**「30/40 層的成本隨 ctx 完全凍結」**——在 2K-32K 的實用區間內 Qwen3.6 verify 比 Gemma4 便宜 25-68%，長上下文（262K）時 30 層固定成本的價值才完全顯現。
+
+---
+
+## §13.51 B=3 batched verify 的權重讀取攤薄（Metal kernel 層，2026-08-08 量化）
+
+### Kernel 事實
+phase-1 MoE kernel（`moe_phase1_gate_up_act_u16load`）：`rowg = tg_idx*8 + sg_idx`，
+`slot = rowg/F`——**同一 expert blob 由多個 threadgroup 讀取（不同 f），batch 內相鄰 token
+選到同一 expert 時 blob 走 L2 重用**（M4 L2 16-24MB，r4 blob 3.2MB / qwen blob 1.6MB）。
+
+### 並集實測（Qwen3.6 40 層 trace，top-8/256）
+| B | union 中位 | union/8 | 重疊率 |
+|---|---|---|---|
+| 2 | 15/16 | 1.88 | 12% |
+| 3 | 21/24 | 2.62 | 12.5% |
+| 4 | 27/32 | 3.38 | 16% |
+| 5 | 31/40 | 3.88 | 22% |
+
+**Qwen3.6 top-8 並集幾乎線性增長**（B=3 重疊僅 ~12%）——「8 experts 載一次餵 3 token」的
+假設在 Qwen3.6 上不成立（相鄰 token 的 top-8 幾乎不重疊）。
+
+### 每 token MoE 權重讀取（並集讀一次，L2 重用）
+| 模型 | 單 token | B=3 每 token | 攤薄 |
+|---|---|---|---|
+| Gemma4 r4（8×3.2MB）| 25.6 MB | 21.8 MB（union 85%）| 0.85× |
+| Qwen3.6（8×1.6MB）| 12.8 MB | 11.2 MB（union 21）| 0.88× |
+
+### 真正的攤薄在 dense 層，不在 MoE
+- **dense 權重（attention + shared expert + norms）每層只讀一次餵 B tokens**：
+  Qwen3.6 dense 40 層 ≈ 904MB → B=3 每 token 301MB = **3× 攤薄**
+- **MoE 權重攤薄只有 0.85-0.88×**（並集重疊太少）
+- 合計：單 token 總權重讀取 ≈ 1289MB；B=3 batch ≈ 1845MB → **每 token 615MB（1.4× 單 token）**
+  → batched verify 的權重讀取沒有「攤薄到小於單 token」，只是「從 3× 變成 1.4×」
+
+### 結論（修正「載一次餵 3 token」的直覺）
+1. **權重讀取攤薄是假的**（Qwen3.6 top-8 並集 88% 線性）——batched verify 的權重流量
+   是單 token 的 ~1.4×/token，不是 1/3
+2. **batched verify 的真正紅利 = 固定成本攤薄**：CB 數（8808×330μs）、kernel launch、
+   sched/idle gap、CPU→GPU sync——一次付給 3 tokens，這才是 B4 pipeline 的實質
+3. **dense 層是免費午餐**：904MB 權重 B 個 token 共享，全常駐下這個優勢完整兌現
+4. 對 Qwen3.6 的意義：verify 的權重讀取成本 = 11.2MB×30 MoE + 301MB dense ≈ 637MB/3 tokens
+   ≈ 212MB/token——**遠小於 503MB 未緩存單 token**，因為熱集/全常駐時 L2 命中吃掉 MoE 大半
