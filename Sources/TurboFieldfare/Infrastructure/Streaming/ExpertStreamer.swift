@@ -7,6 +7,7 @@ enum StreamerError: Error, CustomStringConvertible {
     case bufferWrapFailed
     case preadFailed(errno: Int32)
     case allocFailed(errno: Int32)
+    case mmapFailed(errno: Int32)
     case slotOutOfRange(Int)
 
     public var description: String {
@@ -23,6 +24,8 @@ enum StreamerError: Error, CustomStringConvertible {
             return "pread failed: errno \(error)"
         case .allocFailed(let error):
             return "posix_memalign failed: errno \(error)"
+        case .mmapFailed(let error):
+            return "mmap failed: errno \(error)"
         case .slotOutOfRange(let slot):
             return "expert cache slot \(slot) is out of range"
         }

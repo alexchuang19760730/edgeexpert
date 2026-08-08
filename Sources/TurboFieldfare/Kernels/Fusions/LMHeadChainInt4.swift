@@ -50,6 +50,15 @@ final class LMHeadChainInt4 {
         self.rowSummariesBuffer = rowSummariesBuffer
     }
 
+    /// Encode norm + head + argmax for one hidden row.
+    ///
+    /// `hiddenOffset` selects the row and `outTokenOffset` selects the output
+    /// slot, so a caller can emit argmax for several rows of a `[t, D]` block
+    /// by calling this repeatedly on the same command buffer — batched
+    /// speculative verify needs one token per row, not just the last one.
+    /// That reuse is safe because encoders within a command buffer execute in
+    /// submission order, so each row's use of the shared `xNormedBuffer` /
+    /// `rowSummariesBuffer` scratch completes before the next row overwrites it.
     func encodeGreedyDecode(commandBuffer: MTLCommandBuffer,
                             hidden: MTLBuffer,
                             hiddenOffset: Int = 0,
@@ -62,10 +71,13 @@ final class LMHeadChainInt4 {
                             biases: MTLBuffer,
                             biasesOffset: Int = 0,
                             outToken: MTLBuffer,
+                            outTokenOffset: Int = 0,
                             d: UInt32,
                             vocab: UInt32,
                             rmsEps: Float = 1e-6) {
         precondition(Int(d) <= maxD, "d=\(d) exceeds wrapper maxD=\(maxD)")
+        precondition(outTokenOffset >= 0 && outTokenOffset % 4 == 0,
+                     "outTokenOffset must be a non-negative 4-byte-aligned slot offset")
         precondition(Int(vocab) <= maxVocab,
                      "vocab=\(vocab) exceeds wrapper maxVocab=\(maxVocab)")
         precondition(Int(d) % Quantization.groupSize == 0,
@@ -111,7 +123,7 @@ final class LMHeadChainInt4 {
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.setComputePipelineState(rowReducer)
             encoder.setBuffer(rowSummariesBuffer, offset: 0, index: 0)
-            encoder.setBuffer(outToken, offset: 0, index: 1)
+            encoder.setBuffer(outToken, offset: outTokenOffset, index: 1)
             var rowGroupCount = UInt32(rowGroups)
             encoder.setBytes(&rowGroupCount, length: MemoryLayout<UInt32>.size, index: 2)
 

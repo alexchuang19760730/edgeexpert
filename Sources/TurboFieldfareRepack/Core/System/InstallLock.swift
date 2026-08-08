@@ -12,6 +12,7 @@ public struct RemoteInstallPaths: Sendable, Equatable {
 
     public init(outputDirectory: String) throws {
         let standardized = URL(fileURLWithPath: outputDirectory).standardizedFileURL
+        let standardizedPath = standardized.path
         let basename = standardized.lastPathComponent.precomposedStringWithCanonicalMapping
         guard !basename.isEmpty,
               basename != ".",
@@ -23,13 +24,19 @@ public struct RemoteInstallPaths: Sendable, Equatable {
         }
         let requestedParent = standardized.deletingLastPathComponent().path
         try Posix.mkdirP(requestedParent)
-        let parent = try Posix.physicalPath(requestedParent)
-        let final = (parent as NSString).appendingPathComponent(basename)
+        let final = (requestedParent as NSString).appendingPathComponent(basename)
         let partial = final + ".partial"
-        self.parentDirectory = parent
+        self.parentDirectory = requestedParent
         self.finalDirectory = final
         self.partialDirectory = partial
-        self.lockFile = final + ".install.lock"
+        if try Posix.entryKind(requestedParent) == .symlink {
+            let lockRoot = "/tmp/turbofieldfare-repack-locks"
+            try Posix.mkdirP(lockRoot)
+            let lockStem = String(format: "%016llx", UInt64(bitPattern: Int64(standardizedPath.hashValue)))
+            self.lockFile = (lockRoot as NSString).appendingPathComponent("\(basename).\(lockStem).install.lock")
+        } else {
+            self.lockFile = final + ".install.lock"
+        }
         self.checkpointFile = final + ".resume.json"
         self.rangeTemporaryFile = (partial as NSString)
             .appendingPathComponent(".range.tmp")

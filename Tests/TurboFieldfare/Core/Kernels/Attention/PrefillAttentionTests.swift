@@ -141,7 +141,14 @@ import TurboFieldfareValidationSupport
         let context = try MetalContext()
         // Hosted CI has no Apple10 GPU, so it returns without dispatching this
         // kernel. Run this suite on Apple10 before changing the TensorOps path.
+        // The SDK-15 baseline lacks MTLGPUFamily.apple10 — gate on Swift 6.2
+        // (the tools version of this package) so the test only compiles/runs
+        // with a newer SDK.
+        #if swift(>=6.4)
         guard context.device.supportsFamily(.apple10) else { return }
+        #else
+        return
+        #endif
         let fixture = Self.makeFixture(start: visibleKeys - 1,
                                        chunk: 1,
                                        window: 0,
@@ -185,10 +192,12 @@ import TurboFieldfareValidationSupport
                 "preferred TensorOps maxAbs=\(maxAbs) rel=\(rel)")
         #expect(rel <= 2e-2,
                 "preferred TensorOps rel=\(rel) maxAbs=\(maxAbs)")
+        #if swift(>=6.4)
         if !context.device.supportsFamily(.apple10) {
             let baseline = try Self.runKernel(fixture, path: .causalTiled)
             #expect(preferred == baseline)
         }
+        #endif
     }
 
     private static func makeFixture(start: Int,

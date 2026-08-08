@@ -155,10 +155,10 @@ public enum ManifestReader {
     private static func validateQuant(_ quant: ManifestQuant) throws {
         let slots: [(String, ManifestQuantSlot, Set<Int>)] = [
             ("embedding", quant.embedding, [4]),
-            ("attention", quant.attention, [4]),
+            ("attention", quant.attention, [3, 4]),
             ("router", quant.router, [8]),
             ("sharedExpert", quant.sharedExpert, [4, 8]),
-            ("routedExpert", quant.routedExpert, [4]),
+            ("routedExpert", quant.routedExpert, [2, 3, 4]),
         ]
         for (name, slot, allowedBits) in slots {
             guard allowedBits.contains(slot.weightBits),

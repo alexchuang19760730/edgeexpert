@@ -62,22 +62,50 @@ struct LayerFilePlan: Sendable {
     let expertsPerLayer: Int
     let expertStride: UInt64
     let subTensors: [PerExpertTensorSlice]  // 9 entries: gate/up/down × {weights, scales, biases}
+    private let physicalRankByLogicalExpert: [Int]
     var fileSize: UInt64 { UInt64(expertsPerLayer) * expertStride }
 
     func physicalRank(for logicalExpert: Int) -> Int {
-        logicalExpert
+        physicalRankByLogicalExpert[logicalExpert]
     }
 
     init(layerIndex: Int,
                 path: String,
                 expertsPerLayer: Int,
                 expertStride: UInt64,
-                subTensors: [PerExpertTensorSlice]) {
+                subTensors: [PerExpertTensorSlice],
+                physicalOrder: [Int]? = nil) throws {
         self.layerIndex = layerIndex
         self.path = path
         self.expertsPerLayer = expertsPerLayer
         self.expertStride = expertStride
         self.subTensors = subTensors
+        if expertsPerLayer == 0 {
+            self.physicalRankByLogicalExpert = []
+            return
+        }
+        let resolvedOrder = physicalOrder ?? Array(0..<expertsPerLayer)
+        guard resolvedOrder.count == expertsPerLayer else {
+            throw RepackError.configurationInvalid(detail:
+                "layer \(layerIndex) physical order count \(resolvedOrder.count) != expertsPerLayer \(expertsPerLayer)")
+        }
+        var ranks = Array(repeating: -1, count: expertsPerLayer)
+        for (physicalRank, logicalExpert) in resolvedOrder.enumerated() {
+            guard (0..<expertsPerLayer).contains(logicalExpert) else {
+                throw RepackError.configurationInvalid(detail:
+                    "layer \(layerIndex) physical order expert \(logicalExpert) out of range")
+            }
+            guard ranks[logicalExpert] == -1 else {
+                throw RepackError.configurationInvalid(detail:
+                    "layer \(layerIndex) physical order duplicates expert \(logicalExpert)")
+            }
+            ranks[logicalExpert] = physicalRank
+        }
+        guard ranks.allSatisfy({ $0 >= 0 }) else {
+            throw RepackError.configurationInvalid(detail:
+                "layer \(layerIndex) physical order is not a full permutation")
+        }
+        self.physicalRankByLogicalExpert = ranks
     }
 }
 
@@ -141,7 +169,8 @@ enum RepackPlanner {
     static func plan(meta: IndexLoader.SourceMetadata,
                             arch: ArchInfo,
                             shardHeaders: [Safetensors.Header],
-                            outputDir: String) throws -> RepackPlan {
+                            outputDir: String,
+                            expertLayoutOrder: ExpertLayoutOrder? = nil) throws -> RepackPlan {
 
         // Companion tensors may live in different shards, so resolve them
         // through one global registry.
@@ -196,11 +225,12 @@ enum RepackPlanner {
             // Synthetic snapshots may legitimately have no routed experts.
             guard let gName = bundle["gate"], let uName = bundle["up"], let dName = bundle["down"] else {
                 if bundle.isEmpty {
-                    layerPlans.append(LayerFilePlan(layerIndex: layer,
-                                                    path: (layersDir as NSString).appendingPathComponent("layer_\(String(format: "%02d", layer)).bin"),
-                                                    expertsPerLayer: 0,
-                                                    expertStride: 0,
-                                                    subTensors: []))
+                    layerPlans.append(try LayerFilePlan(
+                        layerIndex: layer,
+                        path: (layersDir as NSString).appendingPathComponent("layer_\(String(format: "%02d", layer)).bin"),
+                        expertsPerLayer: 0,
+                        expertStride: 0,
+                        subTensors: []))
                     continue
                 }
                 throw RepackError.configurationInvalid(detail:
@@ -210,7 +240,10 @@ enum RepackPlanner {
                 .appendingPathComponent("layer_\(String(format: "%02d", layer)).bin")
             let lp = try planLayerFile(path: path, layer: layer,
                                        gateName: gName, upName: uName, downName: dName,
-                                       registry: registry, meta: meta, arch: arch)
+                                       registry: registry, meta: meta, arch: arch,
+                                       physicalOrder: try expertLayoutOrder?.order(
+                                           for: layer,
+                                           expertsPerLayer: arch.numExperts))
             layerPlans.append(lp)
         }
 
@@ -331,7 +364,8 @@ enum RepackPlanner {
                                       gateName: String, upName: String, downName: String,
                                       registry: [String: SourceTensor],
                                       meta: IndexLoader.SourceMetadata,
-                                      arch: ArchInfo) throws -> LayerFilePlan {
+                                      arch: ArchInfo,
+                                      physicalOrder: [Int]? = nil) throws -> LayerFilePlan {
         let expertCount = arch.numExperts
         let roles: [(role: String, name: String)] = [
             ("gate", gateName), ("up", upName), ("down", downName)
@@ -396,10 +430,11 @@ enum RepackPlanner {
         }
 
         let expertStride = roundUpToPage(blobCursor)
-        return LayerFilePlan(layerIndex: layer, path: path,
-                             expertsPerLayer: expertCount,
-                             expertStride: expertStride,
-                             subTensors: subs)
+        return try LayerFilePlan(layerIndex: layer, path: path,
+                                 expertsPerLayer: expertCount,
+                                 expertStride: expertStride,
+                                 subTensors: subs,
+                                 physicalOrder: physicalOrder)
     }
 
     // MARK: - Helpers

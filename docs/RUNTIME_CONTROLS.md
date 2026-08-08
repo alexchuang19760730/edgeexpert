@@ -65,3 +65,15 @@ During chunked prefill, the phase label reports exact progress, for example
 `Prefill (128/514)`. Errors and unsupported configurations appear only when
 they occur. RDADVISE remains experimental and is off by default. A measured
 result is a data point, not a performance ceiling.
+
+### `TURBO_FIELDFARE_ATTN_TENSOROPS`
+
+- **Default**: off
+- **Effect**: routes the full-attention (512/16/2) decode layers through the
+  single-pass MPP tensor-ops kernel (queryCount=1), bypassing the tiled
+  split-KV partial/combine passes for those layers. SWA layers and all other
+  shapes keep the tiled path. Output is byte-identical on the standard test
+  prompts; borderline logits can flip on other prompts (f16 MPP reduction
+  order differs). Measured neutral at short context, marginally positive at
+  600+ context — see B3 §9.6 in the mmap plan doc.
+

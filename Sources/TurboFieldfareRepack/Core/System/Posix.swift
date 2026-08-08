@@ -100,9 +100,32 @@ public enum Posix {
     }
 
     public static func fsyncDirectory(_ path: String) throws {
-        let fd = try openDirectory(path)
-        defer { close(fd) }
-        try fsync(fd, path: path)
+        let candidatePaths: [String]
+        if try entryKind(path) == .symlink {
+            candidatePaths = [path, try physicalPath(path)]
+        } else {
+            candidatePaths = [path]
+        }
+        var lastError: Error?
+        for candidate in candidatePaths {
+            do {
+                let fd = try openDirectory(candidate)
+                defer { close(fd) }
+                try fsync(fd, path: candidate)
+                return
+            } catch {
+                lastError = error
+            }
+        }
+        if let lastError {
+            if case RepackError.fileOpenFailed(_, let err) = lastError, err == EPERM {
+                return
+            }
+            if case RepackError.fsyncFailed(_, let err) = lastError, err == EPERM {
+                return
+            }
+            throw lastError
+        }
     }
 
     public static func rename(from src: String, to dst: String) throws {
@@ -118,8 +141,24 @@ public enum Posix {
     }
 
     public static func mkdirP(_ path: String) throws {
-        let url = URL(fileURLWithPath: path)
-        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        guard !path.isEmpty else { return }
+        let isAbsolute = path.hasPrefix("/")
+        let parts = path.split(separator: "/").map(String.init)
+        var current = isAbsolute ? "/" : ""
+        for part in parts {
+            if current.isEmpty || current == "/" {
+                current += part
+            } else {
+                current += "/" + part
+            }
+            if mkdir(current, 0o755) == 0 {
+                continue
+            }
+            if errno == EEXIST {
+                continue
+            }
+            throw RepackError.fileOpenFailed(path: current, errno: errno)
+        }
     }
 
     public static func physicalPath(_ path: String) throws -> String {

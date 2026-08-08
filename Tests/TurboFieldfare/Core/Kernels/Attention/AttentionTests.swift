@@ -25,6 +25,7 @@ import TurboFieldfareValidationSupport
     @Test func attentionSplitGeometry_reportsEffectiveDispatchShape() throws {
         let swa = Attention.splitGeometry(numQHeads: 16,
                                           numKVHeads: 8,
+                                          headDim: 256,
                                           seqLen: 1536,
                                           kvStart: 512,
                                           preferGQASWA: true)
@@ -36,14 +37,17 @@ import TurboFieldfareValidationSupport
 
         let full = Attention.splitGeometry(numQHeads: 16,
                                            numKVHeads: 2,
+                                           headDim: 512,
                                            seqLen: 1536,
                                            kvStart: 0,
                                            preferGQASWA: false)
         #expect(full.effectiveLength == 1536)
         #expect(full.numChunks == 16)
         #expect(full.chunkLength == 96)
-        #expect(full.partialThreadgroups == 256)
-        #expect(!full.useSWAGroupedPartial)
+        // The 512/16/2 production shape routes through the GQA-full kernel,
+        // whose grid is [numKVHeads * numChunks] = 32 (not 256).
+        #expect(full.partialThreadgroups == 32)
+        #expect(full.useSWAGroupedPartial)
     }
 
     // MARK: - Gemma 4 scale=1.0 path

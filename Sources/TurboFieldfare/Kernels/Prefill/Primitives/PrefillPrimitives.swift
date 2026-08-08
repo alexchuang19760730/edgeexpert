@@ -72,9 +72,11 @@ final class PrefillRMSNorm {
 
 final class PrefillInt4QMM {
     private let pso: MTLComputePipelineState
+    private let psoB3: MTLComputePipelineState?
 
     init(context: MetalContext) throws {
         self.pso = try context.pipeline("prefill_dequant_int4_qmm_f16_block")
+        self.psoB3 = try? context.pipeline("prefill_dequant_int4_qmm_f16_block_b3")
     }
 
     func encode(commandBuffer: MTLCommandBuffer,
@@ -85,11 +87,23 @@ final class PrefillInt4QMM {
                        y: MTLBuffer, yOffset: Int = 0,
                        t: Int,
                        n: Int,
-                       k: Int) {
+                       k: Int,
+                       bits: Int = 4) {
         precondition(k % Quantization.groupSize == 0,
                      "K must be a multiple of \(Quantization.groupSize)")
+        precondition(bits == 3 || bits == 4,
+                     "unsupported attention weight bits \(bits)")
         guard let enc = commandBuffer.makeComputeCommandEncoder() else { return }
-        enc.setComputePipelineState(pso)
+        let selected: MTLComputePipelineState
+        if bits == 3 {
+            guard let b3 = psoB3 else {
+                preconditionFailure("3-bit attention model loaded but prefill b3 QMM pipeline unavailable")
+            }
+            selected = b3
+        } else {
+            selected = pso
+        }
+        enc.setComputePipelineState(selected)
         enc.setBuffer(weights, offset: weightsOffset, index: 0)
         enc.setBuffer(scales, offset: scalesOffset, index: 1)
         enc.setBuffer(biases, offset: biasesOffset, index: 2)

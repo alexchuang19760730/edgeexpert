@@ -224,7 +224,8 @@ struct ServerPromptCacheTests {
             reason: reason,
             kvPosition: kvBacked.count,
             kvBackedTokenIDs: kvBacked,
-            uncommittedBoundaryTokenIDs: [boundary])
+            uncommittedBoundaryTokenIDs: [boundary],
+            routedExpertCacheTelemetrySnapshots: [])
     }
 
     private func validatedFixture(_ name: String) throws -> ValidatedChatRequest {

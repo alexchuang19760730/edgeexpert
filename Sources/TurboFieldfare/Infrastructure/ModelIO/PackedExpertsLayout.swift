@@ -7,6 +7,8 @@ struct SubTensorEntry: Sendable, Equatable {
 struct ExpertEntry: Sendable {
     /// Logical routed-expert id used by the model/router.
     let expert: Int
+    /// Physical ordering inside the layer file. Defaults to logical expert id.
+    let physicalRank: Int
     /// Absolute byte offset of this expert blob's start inside its layer file.
     let offset: UInt64
     /// Total bytes consumed by this expert blob (== `expertStride`).
@@ -16,10 +18,12 @@ struct ExpertEntry: Sendable {
     let subTensors: [String: SubTensorEntry]
 
     init(expert: Int,
+                physicalRank: Int,
                 offset: UInt64,
                 size: UInt64,
                 subTensors: [String: SubTensorEntry]) {
         self.expert = expert
+        self.physicalRank = physicalRank
         self.offset = offset
         self.size = size
         self.subTensors = subTensors
@@ -114,12 +118,12 @@ enum PackedExpertsLayoutReader {
                 guard expertID >= 0 && expertID < expertsPerLayer else {
                     throw ModelError.indexCorrupt(detail: "layout.json: expert id out of range")
                 }
-                let physicalRank = expertObj["physicalRank"] as? Int
-                if let physicalRank,
-                   (physicalRank < 0 || physicalRank >= expertsPerLayer) {
+                let physicalRank = expertObj["physicalRank"] as? Int ?? expertID
+                if physicalRank < 0 || physicalRank >= expertsPerLayer {
                     throw ModelError.indexCorrupt(detail: "layout.json: physicalRank out of range")
                 }
                 experts[expertID] = ExpertEntry(expert: expertID,
+                                                physicalRank: physicalRank,
                                                 offset: offset,
                                                 size: size,
                                                 subTensors: subTensors)

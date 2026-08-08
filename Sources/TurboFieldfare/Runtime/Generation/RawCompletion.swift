@@ -28,6 +28,7 @@ public struct RawDecodeResult: Sendable {
     public let kvPosition: Int
     public let kvBackedTokenIDs: [Int32]
     public let uncommittedBoundaryTokenIDs: [Int32]
+    public let routedExpertCacheTelemetrySnapshots: [RoutedExpertCacheLayerTelemetrySnapshot]
 }
 
 /// Preallocated per-generation buffers (two 512 KiB vocab buffers plus a token
@@ -133,6 +134,10 @@ public func runRawCompletion(producer: any LogitProducer,
         let continuable = producer as! any ContinuableLogitProducer
         try continuable.prepareForContinuation(expectedPosition: cachedPromptTokens)
     }
+    if let requestAware = producer as? any RequestAwareLogitProducer {
+        requestAware.beginRequest()
+        requestAware.beginPrefillPhase()
+    }
     let prefillStart = Date()
     var position = cachedPromptTokens
     var prefillSeed: PrefillSeed?
@@ -174,15 +179,30 @@ public func runRawCompletion(producer: any LogitProducer,
 
     let decodeStart = Date()
     let prefillSeconds = decodeStart.timeIntervalSince(prefillStart)
+    if let requestAware = producer as? any RequestAwareLogitProducer {
+        requestAware.beginDecodePhase()
+    }
     var stopMatcher = StreamingStopMatcher(stops: config.stopStrings)
     var generated = 0
     var reason: StopReason = .maxTokens
     var uncommittedBoundaryTokenIDs: [Int32] = []
+    // Self-speculation acceptance probe (TURBO_FIELDFARE_SPEC_PROBE=1, §13.23):
+    // measures P(greedy[N+1] == token[N]) — the acceptance rate of the
+    // "draft = repeat previous greedy token" scheme. Zero hot-path cost when
+    // disabled. Only meaningful in fused-greedy mode (lastGreedyToken updated).
+    let specProbeEnabled = ProcessInfo.processInfo
+        .environment["TURBO_FIELDFARE_SPEC_PROBE"] == "1"
+    var specProbePrev: UInt32?
+    var specProbeSteps = 0
+    var specProbeAccepts = 0
 
     while true {
         try Task.checkCancellation()
 
         let tokenID: Int32
+        if let requestAware = producer as? any RequestAwareLogitProducer {
+            requestAware.setDecodeStep(index: generated)
+        }
         if generated == 0, let seed = prefillSeed {
             switch seed {
             case .greedyToken(let token):
@@ -229,9 +249,30 @@ public func runRawCompletion(producer: any LogitProducer,
         history.append(tokenID)
         try await producer.produce(token: tokenID, position: position, into: scratch.logits)
         position += 1
+        if specProbeEnabled, let fr = fusedRunner {
+            if let before = specProbePrev {
+                specProbeSteps += 1
+                if fr.lastGreedyToken == before { specProbeAccepts += 1 }
+            }
+            specProbePrev = fr.lastGreedyToken
+        }
         uncommittedBoundaryTokenIDs.removeAll(keepingCapacity: true)
     }
 
+    let routedExpertCacheTelemetrySnapshots: [RoutedExpertCacheLayerTelemetrySnapshot]
+    if let reporting = producer as? any ExpertCacheTelemetryReporting {
+        routedExpertCacheTelemetrySnapshots = reporting.routedExpertCacheTelemetrySnapshots
+    } else {
+        routedExpertCacheTelemetrySnapshots = []
+    }
+
+    if specProbeEnabled {
+        let rate = specProbeSteps > 0 ? Double(specProbeAccepts) / Double(specProbeSteps) : 0
+        let pct = String(format: "%.1f", rate * 100)
+        let p2 = String(format: "%.3f", 1.0 + rate + rate * rate)
+        print("[spec-probe] draft=repeat-prev-greedy accepts=\(specProbeAccepts)/\(specProbeSteps) "
+              + "rate=\(pct)% expected-tokens-per-verify(2-draft)=\(p2) threshold=0.63")
+    }
     return RawDecodeResult(prefillTokens: promptIds.count,
                            cachedPromptTokens: cachedPromptTokens,
                            computedPrefillTokens: computedPrefillTokens,
@@ -241,7 +282,8 @@ public func runRawCompletion(producer: any LogitProducer,
                            reason: reason,
                            kvPosition: position,
                            kvBackedTokenIDs: history,
-                           uncommittedBoundaryTokenIDs: uncommittedBoundaryTokenIDs)
+                           uncommittedBoundaryTokenIDs: uncommittedBoundaryTokenIDs,
+                           routedExpertCacheTelemetrySnapshots: routedExpertCacheTelemetrySnapshots)
 }
 
 private func sampleOnce(scratch: RawCompletionScratch, context: MetalContext,

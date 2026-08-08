@@ -20,6 +20,26 @@ struct PrefillStreamedTileArgumentBuffer {
     let buffer: MTLBuffer
 }
 
+public struct PrefillStreamedTileFetchTiming: Sendable, Equatable {
+    public let planNanos: UInt64
+    public let fetchOpenOrReadNanos: UInt64
+    public let fetchBindingNanos: UInt64
+    public let fetchReadWallNanos: UInt64
+    public let fetchCacheSlotOverheadNanos: UInt64
+
+    public init(planNanos: UInt64 = 0,
+                fetchOpenOrReadNanos: UInt64 = 0,
+                fetchBindingNanos: UInt64 = 0,
+                fetchReadWallNanos: UInt64 = 0,
+                fetchCacheSlotOverheadNanos: UInt64 = 0) {
+        self.planNanos = planNanos
+        self.fetchOpenOrReadNanos = fetchOpenOrReadNanos
+        self.fetchBindingNanos = fetchBindingNanos
+        self.fetchReadWallNanos = fetchReadWallNanos
+        self.fetchCacheSlotOverheadNanos = fetchCacheSlotOverheadNanos
+    }
+}
+
 public struct PrefillStreamedTileFetchResult {
     public let expertIDs: [Int]
     public let binding: PrefillStreamedTileBinding
@@ -28,6 +48,7 @@ public struct PrefillStreamedTileFetchResult {
     public let plannedMissIndices: [Int]
     public let plannedAssignedSlots: [Int]
     public let plannedMissSlots: [Int]
+    public let timing: PrefillStreamedTileFetchTiming
 
     public init(expertIDs: [Int],
                 binding: PrefillStreamedTileBinding,
@@ -35,7 +56,8 @@ public struct PrefillStreamedTileFetchResult {
                 plannedHits: Int,
                 plannedMissIndices: [Int],
                 plannedAssignedSlots: [Int],
-                plannedMissSlots: [Int]) {
+                plannedMissSlots: [Int],
+                timing: PrefillStreamedTileFetchTiming = PrefillStreamedTileFetchTiming()) {
         self.expertIDs = expertIDs
         self.binding = binding
         self.usedPlannedFetch = usedPlannedFetch
@@ -43,6 +65,7 @@ public struct PrefillStreamedTileFetchResult {
         self.plannedMissIndices = plannedMissIndices
         self.plannedAssignedSlots = plannedAssignedSlots
         self.plannedMissSlots = plannedMissSlots
+        self.timing = timing
     }
 }
 
@@ -241,46 +264,74 @@ public struct PrefillStreamedTileBinding: Sendable, Equatable {
                                            layer: Int,
                                            tileIndex: Int,
                                            routes: PrefillMoEGroupedRoutes,
+                                            expertIDs precomputedExpertIDs: [Int]? = nil,
                                            plannedFetch: RoutedExpertFetchPlan? = nil,
-                                           avoidingSlots: Set<Int> = []) async throws
+                                           avoidingSlots: Set<Int> = [],
+                                           accessContext: ExpertCacheAccessContext = .phaseOnly(.prefillTransient)) async throws
         -> PrefillStreamedTileFetchResult {
-        let expertIDs = try expertIDs(forTile: tileIndex, routes: routes)
+        let expertIDs = try precomputedExpertIDs ?? expertIDs(forTile: tileIndex, routes: routes)
+        let planStart = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
         let plan = try plannedFetch ?? model.planRoutedExperts(layer: layer,
                                                                experts: expertIDs,
-                                                               avoidingSlots: avoidingSlots)
+                                                               avoidingSlots: avoidingSlots,
+                                                               accessContext: accessContext)
+        let planNanos = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - planStart
         let views: [TensorView]
         let usedPlannedFetch: Bool
         let plannedHits: Int
         let plannedMissIndices: [Int]
         let plannedAssignedSlots: [Int]
         let plannedMissSlots: [Int]
+        let fetchReadWallNanos: UInt64
+        let fetchCacheSlotOverheadNanos: UInt64
+        let fetchOpenOrReadStart = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
         if let plan {
             guard plan.layer == layer, plan.experts == expertIDs else {
                 throw PrefillGroupedRoutedMoEError.invalidStreamedTileBinding(
                     "preplanned fetch does not match tile \(tileIndex)")
             }
-            views = try await model.fetchRoutedExperts(plan: plan)
+            let fetchResult = try await model.fetchRoutedExpertsDetailed(
+                plan: plan,
+                accessContext: accessContext)
+            views = fetchResult.views
             usedPlannedFetch = true
             plannedHits = plan.hits
             plannedMissIndices = plan.misses
             plannedAssignedSlots = plan.assignedSlots
             plannedMissSlots = plan.misses.map { plan.assignedSlots[$0] }
+            fetchReadWallNanos = fetchResult.executionTiming.readWallNanos
+            fetchCacheSlotOverheadNanos = fetchResult.executionTiming.cacheSlotOverheadNanos
         } else {
-            views = try await model.fetchRoutedExperts(layer: layer, experts: expertIDs)
+            let fetchResult = try await model.fetchRoutedExpertsDetailed(
+                layer: layer,
+                experts: expertIDs,
+                accessContext: accessContext)
+            views = fetchResult.views
             usedPlannedFetch = false
             plannedHits = 0
             plannedMissIndices = []
             plannedAssignedSlots = []
             plannedMissSlots = []
+            fetchReadWallNanos = fetchResult.executionTiming.readWallNanos
+            fetchCacheSlotOverheadNanos = fetchResult.executionTiming.cacheSlotOverheadNanos
         }
+        let fetchOpenOrReadNanos = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - fetchOpenOrReadStart
+        let bindingStart = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
         let binding = try PrefillStreamedTileBinding(expertIDs: expertIDs, views: views)
+        let fetchBindingNanos = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - bindingStart
         return PrefillStreamedTileFetchResult(expertIDs: expertIDs,
                                              binding: binding,
                                              usedPlannedFetch: usedPlannedFetch,
                                              plannedHits: plannedHits,
                                              plannedMissIndices: plannedMissIndices,
                                              plannedAssignedSlots: plannedAssignedSlots,
-                                             plannedMissSlots: plannedMissSlots)
+                                              plannedMissSlots: plannedMissSlots,
+                                              timing: PrefillStreamedTileFetchTiming(
+                                                  planNanos: planNanos,
+                                                  fetchOpenOrReadNanos: fetchOpenOrReadNanos,
+                                                    fetchBindingNanos: fetchBindingNanos,
+                                                    fetchReadWallNanos: fetchReadWallNanos,
+                                                    fetchCacheSlotOverheadNanos: fetchCacheSlotOverheadNanos))
     }
 
     public func validateCoversPairs(_ pairs: [PrefillTokenExpertPair],
@@ -339,6 +390,8 @@ enum PrefillGroupedRoutedMoEError: Error, Equatable, CustomStringConvertible {
 final class PrefillGroupedRoutedMoE {
     private let batchedPhase1PSO: MTLComputePipelineState
     private let batchedDownPSO: MTLComputePipelineState
+    private var bitsPhase1PSO: [Int: MTLComputePipelineState] = [:]
+    private var bitsDownPSO: [Int: MTLComputePipelineState] = [:]
     private let streamedArgEncoder: MTLArgumentEncoder
 
     func makeStreamedArgumentBuffer(device: MTLDevice,
@@ -361,6 +414,12 @@ final class PrefillGroupedRoutedMoE {
     init(context: MetalContext) throws {
         self.batchedPhase1PSO = try context.pipeline("prefill_grouped_routed_moe_batched_phase1")
         self.batchedDownPSO = try context.pipeline("prefill_grouped_routed_moe_batched_down")
+        for bits in [2, 3] {
+            self.bitsPhase1PSO[bits] = try context.pipeline(
+                "prefill_grouped_routed_moe_batched_phase1_b\(bits)")
+            self.bitsDownPSO[bits] = try context.pipeline(
+                "prefill_grouped_routed_moe_batched_down_b\(bits)")
+        }
         guard let streamedFn = context.library.makeFunction(name: "prefill_grouped_routed_moe_batched_phase1") else {
             throw MetalError.missingFunction("prefill_grouped_routed_moe_batched_phase1")
         }
@@ -398,7 +457,14 @@ final class PrefillGroupedRoutedMoE {
                                       argumentBuffer: PrefillStreamedTileArgumentBuffer,
                                       binding: PrefillStreamedTileBinding,
                                       params: PrefillGroupedRoutedMoEStreamedParams,
-                                      pairMicrobatchRows: Int = 32) -> Int {
+                                      pairMicrobatchRows: Int = 32,
+                                      bits: Int = 4) -> Int {
+        let phase1PSO = bits == 2 || bits == 3 ? bitsPhase1PSO[bits]! : batchedPhase1PSO
+        let downPSO = bits == 2 || bits == 3 ? bitsDownPSO[bits]! : batchedDownPSO
+        if ProcessInfo.processInfo.environment["TURBO_FIELDFARE_DEBUG_OFFSETS"] != nil {
+            fputs("[rebits-debug] prefill bits=\(bits) gateWOff=\(params.gateWOff) gateSOff=\(params.gateSOff) "
+                + "upWOff=\(params.upWOff) downWOff=\(params.downWOff) downSOff=\(params.downSOff)\n", stderr)
+        }
         guard params.pairCount > 0,
               params.liveExpertCount == UInt32(binding.views.count),
               pairMicrobatchRows > 0 else { return 0 }
@@ -410,7 +476,7 @@ final class PrefillGroupedRoutedMoE {
             p.pairCount = min(UInt32(pairMicrobatchRows), params.pairCount - consumed)
 
             if let enc = commandBuffer.makeComputeCommandEncoder() {
-                enc.setComputePipelineState(batchedPhase1PSO)
+                enc.setComputePipelineState(phase1PSO)
                 enc.setBuffer(hidden, offset: hiddenOffset, index: PrefillGroupedRoutedMoEBufferIndex.hidden)
                 enc.setBuffer(sortedPairs, offset: sortedPairsOffset, index: PrefillGroupedRoutedMoEBufferIndex.sortedPairs)
                 enc.setBuffer(gateUpActScratch, offset: gateUpActScratchOffset,
@@ -431,7 +497,7 @@ final class PrefillGroupedRoutedMoE {
             }
 
             if let enc = commandBuffer.makeComputeCommandEncoder() {
-                enc.setComputePipelineState(batchedDownPSO)
+                enc.setComputePipelineState(downPSO)
                 enc.setBuffer(sortedPairs, offset: sortedPairsOffset, index: PrefillGroupedRoutedMoEBufferIndex.sortedPairs)
                 enc.setBuffer(routePartials, offset: routePartialsOffset,
                               index: PrefillGroupedRoutedMoEBufferIndex.routePartials)

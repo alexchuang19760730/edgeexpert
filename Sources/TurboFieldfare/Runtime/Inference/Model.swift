@@ -22,6 +22,25 @@ public enum ExpertStreamingMode: Sendable {
     case pread(slotCount: Int)
 }
 
+/// Parsed once (file-scope lazy): hot-pool config from env.
+/// - TURBO_FIELDFARE_HOT_POOL=1              enable
+/// - TURBO_FIELDFARE_HOT_POOL_EXPERTS=N      pool size per layer (default 16)
+/// - TURBO_FIELDFARE_HOT_POOL_PROFILE=<json> per-layer top-N expert ids,
+///   an array of arrays indexed by layer number: [[e1,e2,...], ...]
+private let hotPoolState: (size: Int, profile: [[Int]]?) = {
+    let env = ProcessInfo.processInfo.environment
+    guard env["TURBO_FIELDFARE_HOT_POOL"] == "1" else { return (0, nil) }
+    let size = max(0, Int(env["TURBO_FIELDFARE_HOT_POOL_EXPERTS"] ?? "") ?? 16)
+    guard let raw = env["TURBO_FIELDFARE_HOT_POOL_PROFILE"],
+          !raw.isEmpty,
+          let data = try? Data(contentsOf: URL(fileURLWithPath: raw)),
+          let json = try? JSONSerialization.jsonObject(with: data) as? [[Int]]
+    else {
+        return (0, nil)
+    }
+    return (size, json)
+}()
+
 /// Loaded `.gturbo/` model. Resident weights live behind one mmap'd
 /// `MTLBuffer`; routed expert weights live behind per-layer streaming
 /// backends opened lazily on first touch.
@@ -30,10 +49,23 @@ public struct Model {
     public let config: ArchConfig
     public let streamingMode: ExpertStreamingMode
     public let expertCachePolicy: ExpertCachePolicy
+    public let prefillExpertReadMode: RuntimePrefillExpertReadMode
+    public let prefillExpertLayerLocalReadaheadExperts: Int
+    public let prefillExpertBoundedCoalescedRunExperts: Int
+    public let prefillExpertBoundedParallelMissReadWorkers: Int
     public let integrityPolicy: ModelIntegrityPolicy
     public var modelID: String { manifest.modelID }
     public var sourceSnapshotHash: String? { manifest.sourceSnapshotHash }
     public var sharedExpertWeightBits: Int { manifest.quant?.sharedExpert.weightBits ?? 8 }
+
+    /// Routed-expert weight bit width from the manifest (`quant.routedExpert.weightBits`).
+    /// 4 = production int4; 2/3 = experimental A/B variants produced by TurboFieldfareRebits.
+    public var routedExpertWeightBits: Int { manifest.quant?.routedExpert.weightBits ?? 4 }
+
+    /// Attention (QKV/OProj) weight bit width from the manifest
+    /// (`quant.attention.weightBits`). 4 = production int4; 3 = experimental
+    /// attention-3-bit variant produced by TurboFieldfareRepack bit overrides.
+    public var attentionWeightBits: Int { manifest.quant?.attention.weightBits ?? 4 }
 
     let residentBuffer: ResidentBuffer
     let residentIndex: ResidentIndex
@@ -59,6 +91,10 @@ public struct Model {
          config: ArchConfig,
          streamingMode: ExpertStreamingMode,
          expertCachePolicy: ExpertCachePolicy,
+          prefillExpertReadMode: RuntimePrefillExpertReadMode,
+          prefillExpertLayerLocalReadaheadExperts: Int,
+          prefillExpertBoundedCoalescedRunExperts: Int,
+          prefillExpertBoundedParallelMissReadWorkers: Int,
          integrityPolicy: ModelIntegrityPolicy,
          residentBuffer: ResidentBuffer,
          residentIndex: ResidentIndex,
@@ -69,6 +105,10 @@ public struct Model {
         self.config = config
         self.streamingMode = streamingMode
         self.expertCachePolicy = expertCachePolicy
+        self.prefillExpertReadMode = prefillExpertReadMode
+        self.prefillExpertLayerLocalReadaheadExperts = prefillExpertLayerLocalReadaheadExperts
+        self.prefillExpertBoundedCoalescedRunExperts = prefillExpertBoundedCoalescedRunExperts
+        self.prefillExpertBoundedParallelMissReadWorkers = prefillExpertBoundedParallelMissReadWorkers
         self.integrityPolicy = integrityPolicy
         self.residentBuffer = residentBuffer
         self.residentIndex = residentIndex
@@ -284,11 +324,31 @@ public struct Model {
         case .pread(let configuredSlotCount):
             slotCount = configuredSlotCount
         }
+        let useMmap = ProcessInfo.processInfo
+            .environment["TURBO_FIELDFARE_EXPERT_MMAP"] == "1"
+        let hotPoolExperts: [Int] = {
+            guard !useMmap, hotPoolState.size > 0,
+                  let profile = hotPoolState.profile,
+                  L < profile.count else { return [] }
+            if L == 0 && profile.count != packedExpertsLayout.numLayers {
+                let msg = "warning: hot-pool profile has \(profile.count) layers, "
+                    + "model has \(packedExpertsLayout.numLayers); "
+                    + "layer indices may be misaligned\n"
+                FileHandle.standardError.write(Data(msg.utf8))
+            }
+            return Array(profile[L].prefix(hotPoolState.size))
+        }()
         streamersBox.streamers[L] = try PreadExpertStreamer(
             layout: layout,
             device: device,
             slotCount: slotCount,
-            cachePolicy: expertCachePolicy)
+            useMmap: useMmap,
+            hotPoolExperts: hotPoolExperts,
+              cachePolicy: expertCachePolicy,
+              prefillExpertReadMode: prefillExpertReadMode,
+              prefillExpertLayerLocalReadaheadExperts: prefillExpertLayerLocalReadaheadExperts,
+              boundedCoalescedRunExperts: prefillExpertBoundedCoalescedRunExperts,
+              boundedParallelMissReadWorkers: prefillExpertBoundedParallelMissReadWorkers)
     }
 
     /// Test hook: how many layer files have been opened so far.
@@ -308,6 +368,10 @@ extension Model {
                             expecting: ArchConfig = .gemma4_26B_A4B,
                             streamingMode: ExpertStreamingMode = .pread(slotCount: 16),
                             expertCachePolicy: ExpertCachePolicy = PreadExpertStreamer.cachePolicyDefault,
+                            prefillExpertReadMode: RuntimePrefillExpertReadMode = .baseline,
+                            prefillExpertLayerLocalReadaheadExperts: Int = 16,
+                            prefillExpertBoundedCoalescedRunExperts: Int = 4,
+                            prefillExpertBoundedParallelMissReadWorkers: Int = 2,
                             integrityPolicy: ModelIntegrityPolicy? = nil,
                             loadStats: UnsafeMutablePointer<ModelLoadStats>? = nil) throws -> Model {
         var stats = ModelLoadStats()
@@ -404,6 +468,10 @@ extension Model {
             config: expecting,
             streamingMode: streamingMode,
             expertCachePolicy: expertCachePolicy,
+            prefillExpertReadMode: prefillExpertReadMode,
+            prefillExpertLayerLocalReadaheadExperts: prefillExpertLayerLocalReadaheadExperts,
+            prefillExpertBoundedCoalescedRunExperts: prefillExpertBoundedCoalescedRunExperts,
+            prefillExpertBoundedParallelMissReadWorkers: prefillExpertBoundedParallelMissReadWorkers,
             integrityPolicy: resolvedIntegrityPolicy,
             residentBuffer: residentBuffer,
             residentIndex: residentIndex,

@@ -22,10 +22,14 @@ enum ServerLog {
                           duration: Duration,
                           completion: ServerCompletion) {
         let usage = completion.usage
+        let prefillMs = String(format: "%.3f", completion.prefillMs)
+        let decodeMs = String(format: "%.3f", completion.decodeMs)
         write("request \(id) completed in \(format(duration)) "
             + "prompt=\(usage.promptTokens) "
             + "cached=\(usage.promptTokensDetails.cachedTokens) "
             + "completion=\(usage.completionTokens) "
+            + "prefill_ms=\(prefillMs) "
+            + "decode_ms=\(decodeMs) "
             + "finish=\(completion.finishReason)")
     }
 

@@ -3,6 +3,7 @@ public struct RemoteStreamingRepackOptions: Sendable {
     public let repoID: String
     public let revision: String
     public let outputDir: String
+    public let expertLayoutOrder: ExpertLayoutOrder?
     public let token: String?
     public let requireKnownSource: Bool
     public let copyAuditPath: String?
@@ -20,6 +21,7 @@ public struct RemoteStreamingRepackOptions: Sendable {
     public init(repoID: String,
                 revision: String,
                 outputDir: String,
+                expertLayoutOrder: ExpertLayoutOrder? = nil,
                 token: String? = nil,
                 requireKnownSource: Bool = false,
                 copyAuditPath: String? = nil,
@@ -36,6 +38,7 @@ public struct RemoteStreamingRepackOptions: Sendable {
         self.repoID = repoID
         self.revision = revision
         self.outputDir = outputDir
+        self.expertLayoutOrder = expertLayoutOrder
         self.token = token
         self.requireKnownSource = requireKnownSource
         self.copyAuditPath = copyAuditPath
@@ -187,11 +190,12 @@ public final class RemoteStreamingRepacker {
         let plan = try RepackPlanner.plan(meta: snapshot.metadata,
                                           arch: snapshot.arch,
                                           shardHeaders: snapshot.shardHeaders,
-                                          outputDir: paths.partialDirectory)
+                                          outputDir: paths.partialDirectory,
+                                          expertLayoutOrder: options.expertLayoutOrder)
         let rangePlan = try RangeCopyPlanner.plan(repackPlan: plan,
                                                   rangeChunkBytes: options.rangeChunkBytes,
-                                                  layoutMode: "identity",
-                                                  layoutOrderSha256: nil)
+                                                  layoutMode: options.expertLayoutOrder?.strategy ?? "identity",
+                                                  layoutOrderSha256: options.expertLayoutOrder?.sha256Hex)
         var checkpoint = saved ?? RemoteInstallCheckpoint(
             repoID: options.repoID,
             requestedRevision: options.revision,
@@ -250,7 +254,11 @@ public final class RemoteStreamingRepacker {
         audit.sourceSnapshotSha256 = snapshot.metadata.indexSha256Hex
         audit.bitWidthOverridesHonored = snapshot.metadata.bitsOverrides.count
         audit.tensorsDroppedMultimodal = plan.excludedMultimodalTensorNames
-        audit.packedExpertLayoutMode = "identity"
+        audit.packedExpertLayoutMode = options.expertLayoutOrder?.strategy ?? "identity"
+        audit.packedExpertLayoutOrderPath = options.expertLayoutOrder?.sourcePath
+        audit.packedExpertLayoutOrderSha256 = options.expertLayoutOrder?.sha256Hex
+        audit.packedExpertLayoutStrategy = options.expertLayoutOrder?.strategy
+        audit.packedExpertReorderedLayerCount = options.expertLayoutOrder?.reorderedLayerCount ?? 0
 
         if options.dryRunSpaceCheck {
             if saved == nil {
@@ -326,6 +334,9 @@ public final class RemoteStreamingRepacker {
         let layoutData = try GTurboJSON.encodeLayout(plan: plan, expertStride: expertStride)
         try writeSmall(path: layoutPath, data: layoutData)
         try GTurboLayoutValidator.validate(path: layoutPath, plan: plan)
+        audit.packedExpertLayoutAuditLogicalIDCount =
+            plan.layers.reduce(0) { $0 + $1.expertsPerLayer }
+        audit.packedExpertLayoutOffsetValidationPassed = true
         try recordOutputFile(relativePath: "packed_experts/layout.json",
                              path: layoutPath,
                              progress: progress)

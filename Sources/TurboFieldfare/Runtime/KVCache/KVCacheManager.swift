@@ -208,6 +208,24 @@ public final class KVCacheManager {
         position += count
     }
 
+    /// Roll the write cursor back after a rejected speculative branch.
+    ///
+    /// Batched speculative verify forwards `[current, draft…]` in one pass, so
+    /// K/V for the rejected suffix is already in the cache. Only the cursor has
+    /// to move: attention reads `[0, validTokenCount)` and the next write lands
+    /// on the same physical slots, overwriting the stale entries. No zeroing is
+    /// needed for the same reason `reset()` skips it.
+    ///
+    /// Ring layers stay consistent because `physicalSlot` and `ringStartSlot`
+    /// are both pure functions of `position` — rewinding reproduces exactly the
+    /// slot mapping that the shorter prefix had.
+    public func rewind(to newPosition: Int) {
+        precondition(newPosition >= 0, "rewind target must be non-negative")
+        precondition(newPosition <= position,
+                     "rewind target \(newPosition) is ahead of cursor \(position)")
+        position = newPosition
+    }
+
     /// Drop all cached positions and return physical pages to the OS.
     ///
     /// No buffer zeroing — the attention kernels read only `[0, validTokenCount]`,

@@ -27,16 +27,28 @@ final class Attention {
     private let ctx: MetalContext
     private let psoPartial: MTLComputePipelineState
     private let psoGQAPartial: MTLComputePipelineState
+    private let psoGQAFullPartial: MTLComputePipelineState
     private let psoCombine: MTLComputePipelineState
     private let psoPartialSWA: MTLComputePipelineState
     private let psoPartialFull: MTLComputePipelineState
     private let psoGQAPartialSWA: MTLComputePipelineState
     private let psoGQAPartialSWAChunks16: MTLComputePipelineState
     private let psoPartialFullChunks16: MTLComputePipelineState
+    private let psoGQAFullPartialFull: MTLComputePipelineState
+    private let psoGQAFullPartialFullChunks16: MTLComputePipelineState
     private let psoCombineSWA: MTLComputePipelineState
     private let psoCombineFull: MTLComputePipelineState
     private let psoCombineSWAChunks16: MTLComputePipelineState
     private let psoCombineFullChunks16: MTLComputePipelineState
+    /// B3: single-pass MPP tensor-core decode attention for the full-attention
+    /// shape (512/16/2). Reuses the prefill tensor-ops kernel with queryCount=1
+    /// (the same flash attention math as prefill, one query token). Env-gated
+    /// via TURBO_FIELDFARE_ATTN_TENSOROPS=1, off by default.
+    private let psoDecodeTensorOps: MTLComputePipelineState?
+    /// Plan B (2026-08-08): single-pass SWA decode kernel — one Q head per TG,
+    /// full KV scan, direct write (no partial scratch / no combine). Env-gated
+    /// TURBO_FIELDFARE_ATTN_SINGLE=1, SWA 256/16/8, ring-free only.
+    private let psoSingle: MTLComputePipelineState?
 
     /// Mirrors `kAttnThreads` in `attention.metal`. The kernel was authored
     /// with a hardcoded 256-thread group so its threadgroup-memory scratch
@@ -64,6 +76,7 @@ final class Attention {
         self.ctx = context
         self.psoPartial = try context.pipeline("attention_decode_partial")
         self.psoGQAPartial = try context.pipeline("attention_decode_gqa_swa_partial")
+        self.psoGQAFullPartial = try context.pipeline("attention_decode_gqa_full_partial")
         self.psoCombine = try context.pipeline("attention_decode_combine")
         self.psoPartialSWA = try Self.specializedPipeline(context,
                                                           "attention_decode_partial",
@@ -80,6 +93,17 @@ final class Attention {
                                                              headDim: 256,
                                                              numQHeads: 16,
                                                              numKVHeads: 8)
+        self.psoGQAFullPartialFull = try Self.specializedPipeline(context,
+                                                                  "attention_decode_gqa_full_partial",
+                                                                  headDim: 512,
+                                                                  numQHeads: 16,
+                                                                  numKVHeads: 2)
+        self.psoGQAFullPartialFullChunks16 = try Self.specializedPipeline(context,
+                                                                          "attention_decode_gqa_full_partial",
+                                                                          headDim: 512,
+                                                                          numQHeads: 16,
+                                                                          numKVHeads: 2,
+                                                                          numChunks: 16)
         self.psoGQAPartialSWAChunks16 = try Self.specializedPipeline(context,
                                                                      "attention_decode_gqa_swa_partial",
                                                                      headDim: 256,
@@ -114,6 +138,16 @@ final class Attention {
                                                                    numQHeads: 16,
                                                                    numKVHeads: 2,
                                                                    numChunks: 16)
+        // MPP tensor cores (Apple9+) only; nil on older GPUs keeps the tiled
+        // path. Mirrors PrefillAttention's gating.
+        self.psoDecodeTensorOps = context.device.supportsFamily(.apple9)
+            ? try? context.pipeline("attention_prefill_full_tensorops_2d_validity_v2")
+            : nil
+        self.psoSingle = try? Self.specializedPipeline(context,
+                                                       "attention_decode_single",
+                                                       headDim: 256,
+                                                       numQHeads: 16,
+                                                       numKVHeads: 8)
         let md = Self.maxQHeads * Self.maxChunks
         guard let m = context.device.makeBuffer(length: md * MemoryLayout<Float>.size,
                                                 options: .storageModeShared),
@@ -128,32 +162,71 @@ final class Attention {
 
     /// Number of K/V chunks for a range of `effLen` positions — the split
     /// factor used by the production split path.
+    /// A/B knob: TURBO_FIELDFARE_ATTN_CHUNKS=<n> overrides the default chunk
+    /// count (both SWA and full) to sweep the per-TG-work vs TG-count tradeoff
+    /// (SWA phase-2 probe). Absent -> production defaults (SWA 8, full 16).
+    private static let chunkOverride: Int? = {
+        guard let v = ProcessInfo.processInfo.environment["TURBO_FIELDFARE_ATTN_CHUNKS"],
+              let n = Int(v), n > 0 else { return nil }
+        return n
+    }()
+
+    /// Plan A (2026-08-08): dynamic chunk count targeting ~64 K/V positions per
+    /// chunk. Short contexts (the decode-heavy case, e.g. 128 tok) naturally
+    /// collapse to fewer chunks (128 -> 2), which the chunk sweep showed is
+    /// the 128-token sweet spot (+7% decode, -8% attn GPU vs fixed 8); long
+    /// contexts stay bounded by the per-path default. `chunkOverride` still
+    /// wins for A/B probes.
     static func chunkCount(effLen: Int, preferGQASWA: Bool = false) -> Int {
         let eff = max(1, effLen)
+        if let c = Self.chunkOverride {
+            return max(1, min(c, min(maxChunks, eff)))
+        }
+        let targetPerChunk = 64
+        let dynamic = max(1, (eff + targetPerChunk - 1) / targetPerChunk)
         let defaultChunks = preferGQASWA ? defaultGQASWAChunks : defaultFullChunks
-        return max(1, min(defaultChunks, min(maxChunks, eff)))
+        return max(1, min(dynamic, min(defaultChunks, min(maxChunks, eff))))
     }
 
     static func splitGeometry(numQHeads: UInt32,
                                      numKVHeads: UInt32,
+                                     headDim: UInt32,
                                      seqLen: UInt32,
                                      kvStart: UInt32,
                                      preferGQASWA: Bool) -> AttentionSplitGeometry {
         let qPerKV = Int(numQHeads / numKVHeads)
-        let useSWAGQAPartial = preferGQASWA && qPerKV <= 2
+        // GQA-partial kernels process every Q head sharing a KV head in one
+        // threadgroup, so their grid is [numKVHeads * numChunks] instead of
+        // [numQHeads * numChunks]. The full path uses such a kernel whenever
+        // the shape is 512/16/2 (8 Q per KV) — enable the grouped geometry
+        // there too, otherwise encodeSplit would dispatch q_per_kv redundant
+        // threadgroups that all write the same output region.
+        let useGQAAny = preferGQASWA && qPerKV <= 2
+        // The GQA-full kernel exists for the production full-attention shape
+        // (512/16/2). Only that shape routes through it; every other full
+        // shape keeps the generic per-q-head kernel (which is correct for any
+        // head_dim, and avoids the GQA-full kernel's 512-only assumptions).
+        let useGQAFull = !preferGQASWA && qPerKV > 2
+            && numQHeads == 16 && numKVHeads == 2 && headDim == 512
+        let useGroupedPartial = useGQAAny || useGQAFull
         let effectiveLength = Int(seqLen) - Int(kvStart)
+        // Chunk default depends on the true path: SWA uses 8 base chunks,
+        // full uses 16. The GQA-full kernel runs 8 Q heads per TG so it keeps
+        // the full-16 chunking (do NOT amplify by q_per_kv — 16×8=128 would
+        // exceed maxChunks; unlike the GQA-SWA kernel it needs no amplification
+        // because its 8 Q heads already provide the parallelism).
         let baseChunks = Self.chunkCount(effLen: effectiveLength,
-                                         preferGQASWA: useSWAGQAPartial)
-        let numChunks = useSWAGQAPartial
+                                         preferGQASWA: useGQAAny)
+        let numChunks = useGQAAny
             ? max(baseChunks, min(Self.maxChunks, baseChunks * qPerKV))
             : baseChunks
         let chunkLength = (max(1, effectiveLength) + numChunks - 1) / numChunks
-        let partialHeadGroups = useSWAGQAPartial ? Int(numKVHeads) : Int(numQHeads)
+        let partialHeadGroups = useGroupedPartial ? Int(numKVHeads) : Int(numQHeads)
         return AttentionSplitGeometry(effectiveLength: effectiveLength,
                                       numChunks: numChunks,
                                       chunkLength: chunkLength,
                                       partialThreadgroups: partialHeadGroups * numChunks,
-                                      useSWAGroupedPartial: useSWAGQAPartial)
+                                      useSWAGroupedPartial: useGroupedPartial)
     }
 
 
@@ -181,6 +254,26 @@ final class Attention {
         let sc = scale ?? Self.defaultScale(headDim: headDim)
         let kvStart = seqLen > window ? seqLen - window : 0
 
+        // Plan B (2026-08-08): single-pass SWA kernel when enabled and the
+        // shape matches (256/16/8, ring-free). One TG per Q head scanning the
+        // whole visible KV range, direct write — no combine launch, no
+        // partial scratch round-trip. Byte-identity must be verified per
+        // prompt (FP accumulation order is position-sequential either way).
+        if Self.singlePassEnabled
+            && psoSingle != nil
+            && headDim == 256 && numQHeads == 16 && numKVHeads == 8
+            && ringCapacity == 0 {
+            encodeSingle(commandBuffer: commandBuffer,
+                         q: q, qOffset: qOffset,
+                         k: k, kOffset: kOffset,
+                         v: v, vOffset: vOffset,
+                         out: out, outOffset: outOffset,
+                         headDim: headDim, numQHeads: numQHeads,
+                         numKVHeads: numKVHeads, seqLen: seqLen,
+                         kvStart: kvStart, scale: sc)
+            return
+        }
+
         encodeSplit(commandBuffer: commandBuffer,
                     q: q, qOffset: qOffset, k: k, kOffset: kOffset,
                     v: v, vOffset: vOffset, out: out, outOffset: outOffset,
@@ -188,6 +281,46 @@ final class Attention {
                     seqLen: seqLen, kvStart: kvStart, scale: sc,
                     preferGQASWA: true,
                     ringCapacity: ringCapacity)
+    }
+
+    /// Plan B opt-in flag (static let: read once, not per SWA layer).
+    private static let singlePassEnabled: Bool =
+        ProcessInfo.processInfo.environment["TURBO_FIELDFARE_ATTN_SINGLE"] == "1"
+    /// Cross-ref: keep the online-softmax recurrence in attention_decode_single
+    /// (attention.metal) in sync with attention_decode_partial — same math. If
+    /// one changes the recurrence, the other must too (both are off-by-default
+    /// experimental variants of the production split path).
+    private static let _syncNote: Void = ()
+
+    /// Single-pass SWA decode attention: one TG per Q head, full visible K/V
+    /// scan, direct FP16 write to `out`.
+    private func encodeSingle(commandBuffer: MTLCommandBuffer,
+                              q: MTLBuffer, qOffset: Int,
+                              k: MTLBuffer, kOffset: Int,
+                              v: MTLBuffer, vOffset: Int,
+                              out: MTLBuffer, outOffset: Int,
+                              headDim: UInt32, numQHeads: UInt32,
+                              numKVHeads: UInt32, seqLen: UInt32,
+                              kvStart: UInt32, scale: Float) {
+        guard let pso = psoSingle else { return }
+        guard let enc = commandBuffer.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(q, offset: qOffset, index: 0)
+        enc.setBuffer(k, offset: kOffset, index: 1)
+        enc.setBuffer(v, offset: vOffset, index: 2)
+        enc.setBuffer(out, offset: outOffset, index: 3)
+        var hd = headDim, nq = numQHeads, nkv = numKVHeads
+        var sl = seqLen, ks = kvStart, sc = scale
+        enc.setBytes(&hd,  length: MemoryLayout<UInt32>.size, index: 4)
+        enc.setBytes(&nq,  length: MemoryLayout<UInt32>.size, index: 5)
+        enc.setBytes(&nkv, length: MemoryLayout<UInt32>.size, index: 6)
+        enc.setBytes(&sl,  length: MemoryLayout<UInt32>.size, index: 7)
+        enc.setBytes(&ks,  length: MemoryLayout<UInt32>.size, index: 8)
+        enc.setBytes(&sc,  length: MemoryLayout<Float>.size,  index: 9)
+        enc.dispatchThreadgroups(
+            MTLSize(width: Int(numQHeads), height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: Self.threadsPerGroup, height: 1, depth: 1))
+        enc.endEncoding()
     }
 
     /// Full attention. Gemma 4 reuses the raw K projection as raw V input, but
@@ -210,6 +343,28 @@ final class Attention {
         precondition(seqLen > 0, "full attention requires at least one KV position")
         let sc = scale ?? Self.defaultScale(headDim: headDim)
 
+        // B3: single-pass MPP tensor-ops decode attention. Only the production
+        // full-attention shape (512/16/2) matches the tensor kernel's
+        // compile-time 8-output/64-key/512-dim geometry; SWA layers (256/16/8)
+        // and all other shapes keep the tiled split path.
+        if Self.decodeTensorOpsEnabled
+            && psoDecodeTensorOps != nil
+            && headDim == 512
+            && numQHeads == 16
+            && numKVHeads == 2
+            && sc == 1.0 {
+            // f16 MPP accumulation order differs from the tiled f32 path, so
+            // borderline logits can flip on some prompts (output verified
+            // byte-identical on the standard test prompts; env-gated opt-in).
+            encodeDecodeTensorOps(commandBuffer: commandBuffer,
+                                  q: q, qOffset: qOffset,
+                                  k: k, kOffset: kOffset,
+                                  v: v, vOffset: vOffset,
+                                  out: out, outOffset: outOffset,
+                                  headDim: headDim, numQHeads: numQHeads,
+                                  numKVHeads: numKVHeads, seqLen: seqLen)
+            return
+        }
 
         encodeSplit(commandBuffer: commandBuffer,
                     q: q, qOffset: qOffset, k: k, kOffset: kOffset,
@@ -219,6 +374,63 @@ final class Attention {
                     preferGQASWA: false)
     }
 
+
+    /// B3 opt-in flag: TURBO_FIELDFARE_ATTN_TENSOROPS=1 routes the full-attention
+    /// 512/16/2 decode layers through the single-pass MPP tensor-ops kernel.
+    /// `== "1"` so that `=0` is a true opt-out (presence alone is not enough).
+    ///
+    /// NOTE (2026-08-08): on this SDK the MPP kernel never compiles — the
+    /// tensor kernel is guarded by `#if defined(__HAVE_TENSOR__)` in
+    /// prefill.metal, and the local CLT SDK has no MetalPerformancePrimitives.h,
+    /// so `__HAVE_TENSOR__` stays undefined, `psoDecodeTensorOps == nil`, and
+    /// every decode layer falls through to the tiled split path regardless of
+    /// this flag. Measured: ATTEN_TENSOROPS=0 vs =1 produce byte-identical
+    /// output AND identical GPU time (both are split). The flag is inert here.
+    private static var decodeTensorOpsEnabled: Bool {
+        ProcessInfo.processInfo.environment["TURBO_FIELDFARE_ATTN_TENSOROPS"] == "1"
+    }
+
+    /// Single-pass decode attention for one query token via the MPP tensor-ops
+    /// kernel (queryCount = 1, all keys visible). Writes `out` directly — no
+    /// partial/combine passes, no split-KV scratch. The K/V pointer convention
+    /// (kOffset/vOffset into the layer KV, [pos, kvHead, dim]) matches the
+    /// tiled encodeSplit path.
+    private func encodeDecodeTensorOps(commandBuffer: MTLCommandBuffer,
+                                       q: MTLBuffer, qOffset: Int,
+                                       k: MTLBuffer, kOffset: Int,
+                                       v: MTLBuffer, vOffset: Int,
+                                       out: MTLBuffer, outOffset: Int,
+                                       headDim: UInt32, numQHeads: UInt32,
+                                       numKVHeads: UInt32, seqLen: UInt32) {
+        guard let pso = psoDecodeTensorOps else { return }
+        guard let enc = commandBuffer.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(q, offset: qOffset, index: 0)
+        enc.setBuffer(k, offset: kOffset, index: 1)
+        enc.setBuffer(v, offset: vOffset, index: 2)
+        enc.setBuffer(out, offset: outOffset, index: 3)
+        var params = PrefillAttentionParams(
+            startPosition: seqLen - 1,
+            queryCount: 1,
+            headDim: headDim,
+            numQHeads: numQHeads,
+            numKVHeads: numKVHeads,
+            kvValidCount: seqLen,
+            // The tensor kernel ignores slidingWindow (starts at key 0);
+            // full-attention layers have no window.
+            slidingWindow: 0,
+            kvTokenStrideElements: numKVHeads * headDim,
+            qTokenStrideElements: headDim,
+            oTokenStrideElements: headDim,
+            scale: 1.0)
+        enc.setBytes(&params, length: MemoryLayout<PrefillAttentionParams>.stride, index: 4)
+        // One threadgroup per KV-head group (8 Q heads each); 128 threads
+        // matches the prefill tensor kernel's threadgroup size.
+        enc.dispatchThreadgroups(
+            MTLSize(width: 1, height: Int(numQHeads) / 8, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+        enc.endEncoding()
+    }
 
     /// Two-pass split-KV (Flash-Decoding) dispatch shared by SWA and full
     /// attention — they differ only by `kvStart`. Pass 1 fans the head's
@@ -242,6 +454,7 @@ final class Attention {
                      "FP16 KV ring is only valid for SWA attention")
         let geometry = Self.splitGeometry(numQHeads: numQHeads,
                                           numKVHeads: numKVHeads,
+                                          headDim: headDim,
                                           seqLen: seqLen,
                                           kvStart: kvStart,
                                           preferGQASWA: preferGQASWA)
@@ -254,7 +467,7 @@ final class Attention {
                                          numChunks: nChunks,
                                          useGQAPartial: useSWAGQAPartial,
                                          ringCapacity: ringCapacity)
-        let tgWidth = min(Self.threadsPerGroup, Int(partialPSO.maxTotalThreadsPerThreadgroup))
+        let tgWidth = Int(partialPSO.maxTotalThreadsPerThreadgroup)
 
         guard let p1 = commandBuffer.makeComputeCommandEncoder() else { return }
         p1.setComputePipelineState(partialPSO)
@@ -358,11 +571,11 @@ final class Attention {
         if !useGQAPartial && headDim == 256 && numQHeads == 16 && numKVHeads == 8 {
             return psoPartialSWA
         }
-        if !useGQAPartial && headDim == 512 && numQHeads == 16 && numKVHeads == 2 {
-            if numChunks == 16 {
-                return psoPartialFullChunks16
-            }
-            return psoPartialFull
+        if useGQAPartial && headDim == 512 && numQHeads == 16 && numKVHeads == 2 {
+            // Full attention: 8 Q heads share each KV head. The GQA-full
+            // kernel reads each K/V row once per chunk and serves all 8 Q
+            // heads from it (the generic kernel would re-read 8x).
+            return numChunks == 16 ? psoGQAFullPartialFullChunks16 : psoGQAFullPartialFull
         }
         return useGQAPartial ? psoGQAPartial : psoPartial
     }

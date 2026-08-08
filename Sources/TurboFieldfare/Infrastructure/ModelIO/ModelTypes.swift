@@ -122,6 +122,7 @@ enum ModelError: Error, CustomStringConvertible, Equatable {
     case indexCorrupt(detail: String)
     case posixFailed(call: String, errno: Int32)
     case trustedReceiptInvalid(detail: String)
+    case hitOnlySyncWithMisses
 
     public var description: String {
         switch self {
@@ -151,6 +152,8 @@ enum ModelError: Error, CustomStringConvertible, Equatable {
             return "resident index is corrupt: \(d)"
         case .posixFailed(let c, let e):
             return "\(c) failed with errno \(e)"
+        case .hitOnlySyncWithMisses:
+            return "B4 hit-only sync fetch called on a plan with misses"
         case .trustedReceiptInvalid(let detail):
             return "trusted install receipt invalid: \(detail)"
         }

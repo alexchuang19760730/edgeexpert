@@ -708,6 +708,54 @@ kernel void prefill_dequant_int4_qmm_f16_block(
     Y[t * N + n] = half(acc);
 }
 
+kernel void prefill_dequant_int4_qmm_f16_block_b3(
+    device const uint8_t* W      [[buffer(0)]],
+    device const bfloat*  scales [[buffer(1)]],
+    device const bfloat*  biases [[buffer(2)]],
+    device const half*    X      [[buffer(3)]],
+    device half*          Y      [[buffer(4)]],
+    constant uint&        T      [[buffer(5)]],
+    constant uint&        N      [[buffer(6)]],
+    constant uint&        K      [[buffer(7)]],
+    uint2                 tid    [[thread_position_in_threadgroup]],
+    uint2                 tgid   [[threadgroup_position_in_grid]]
+) {
+    // 3-bit affine: same per-group scale/bias, codes packed LSB-first at 3
+    // bits each (8 codes per 24 bits), row stride K*3/8. Mirrors
+    // QuantizedAffineRow packing (Quantization.swift) and the decode b3 GEMV.
+    const uint n = tgid.x * 8u + tid.x;
+    const uint t = tgid.y * 8u + tid.y;
+    if (t >= T || n >= N) return;
+
+    const uint groups = K / kPrefillGroupSize;
+    const uint row_bytes = K * 3u / 8u;
+    device const uint8_t* w_row = W + n * row_bytes;
+    device const bfloat* s_row = scales + n * groups;
+    device const bfloat* b_row = biases + n * groups;
+    device const half* x_row = X + t * K;
+
+    float acc = 0.0f;
+    for (uint g = 0; g < groups; ++g) {
+        const float scale = float(s_row[g]);
+        const float bias = float(b_row[g]);
+        const uint group_base = g * kPrefillGroupSize;
+        for (uint kk = 0; kk < kPrefillGroupSize; ++kk) {
+            const uint k = group_base + kk;
+            const uint bit = k * 3u;
+            const uint b0 = bit >> 3u;
+            const uint sh = bit & 7u;
+            // K*3 is a multiple of 8 for every attention K (2816/4096), so the
+            // low 3 bits never straddle the row-end byte; the extra byte read
+            // at b0+1 == row_bytes is the next row's first byte (in-bounds).
+            const uint gv = uint(w_row[b0]) | (uint(w_row[b0 + 1u]) << 8);
+            const uint q = (gv >> sh) & 0x7u;
+            const float w = fma(float(q), scale, bias);
+            acc = fma(w, float(x_row[k]), acc);
+        }
+    }
+    Y[t * N + n] = half(acc);
+}
+
 static inline void prefill_rope_apply_neox_pair(
     device half* head_ptr,
     uint i,
@@ -1165,3 +1213,238 @@ kernel void attention_prefill_full_tensorops_2d_validity_v2(
 }
 
 #endif
+
+
+// ============================================================================
+// 2-bit / 3-bit routed-expert prefill decode (A/B variants). Same layout
+// convention as prefill_moe_int4_gemv_row_dev but bit-packed W.
+// ============================================================================
+
+static inline float prefill_moe_int2_gemv_row_dev(
+    device const uint8_t* W,
+    device const bfloat* S,
+    device const bfloat* B,
+    device const half* x,
+    uint row,
+    uint N
+) {
+    const uint groups = N / kPrefillGroupSize;
+    const uint row_bytes = N / 4u;
+    device const uint8_t* W_row = W + row * row_bytes;
+    device const bfloat* s_row = S + row * groups;
+    device const bfloat* b_row = B + row * groups;
+
+    float acc = 0.0f;
+    for (uint g = 0; g < groups; ++g) {
+        const float scale = float(s_row[g]);
+        const float bias = float(b_row[g]);
+        device const uint8_t* Wg = W_row + g * 16u;
+        device const half* xg = x + g * kPrefillGroupSize;
+        float dot_qx = 0.0f;
+        float sum_x = 0.0f;
+        for (uint k = 0; k < 16u; ++k) {
+            const uint8_t packed = Wg[k];
+            const uint base = k * 4u;
+            dot_qx = fma(float(uint(packed       ) & 0x3u), float(xg[base]),     dot_qx);
+            dot_qx = fma(float(uint(packed >> 2u ) & 0x3u), float(xg[base + 1u]), dot_qx);
+            dot_qx = fma(float(uint(packed >> 4u ) & 0x3u), float(xg[base + 2u]), dot_qx);
+            dot_qx = fma(float(uint(packed >> 6u ) & 0x3u), float(xg[base + 3u]), dot_qx);
+            sum_x += float(xg[base]) + float(xg[base + 1u]) + float(xg[base + 2u]) + float(xg[base + 3u]);
+        }
+        acc = fma(scale, dot_qx, acc);
+        acc = fma(bias, sum_x, acc);
+    }
+    return acc;
+}
+
+static inline float prefill_moe_int3_gemv_row_dev(
+    device const uint8_t* W,
+    device const bfloat* S,
+    device const bfloat* B,
+    device const half* x,
+    uint row,
+    uint N
+) {
+    const uint groups = N / kPrefillGroupSize;
+    const uint row_bytes = N * 3u / 8u;
+    device const uint8_t* W_row = W + row * row_bytes;
+    device const bfloat* s_row = S + row * groups;
+    device const bfloat* b_row = B + row * groups;
+
+    float acc = 0.0f;
+    for (uint g = 0; g < groups; ++g) {
+        const float scale = float(s_row[g]);
+        const float bias = float(b_row[g]);
+        device const uint8_t* Wg = W_row + g * 24u;
+        device const half* xg = x + g * kPrefillGroupSize;
+        float dot_qx = 0.0f;
+        float sum_x = 0.0f;
+        for (uint k = 0; k < 8u; ++k) {
+            const uint base = k * 8u;
+            const uint v = uint(Wg[k * 3u])
+                         | (uint(Wg[k * 3u + 1u]) << 8)
+                         | (uint(Wg[k * 3u + 2u]) << 16);
+            dot_qx = fma(float((v       ) & 0x7u), float(xg[base]),     dot_qx);
+            dot_qx = fma(float((v >> 3u ) & 0x7u), float(xg[base + 1u]), dot_qx);
+            dot_qx = fma(float((v >> 6u ) & 0x7u), float(xg[base + 2u]), dot_qx);
+            dot_qx = fma(float((v >> 9u ) & 0x7u), float(xg[base + 3u]), dot_qx);
+            dot_qx = fma(float((v >> 12u) & 0x7u), float(xg[base + 4u]), dot_qx);
+            dot_qx = fma(float((v >> 15u) & 0x7u), float(xg[base + 5u]), dot_qx);
+            dot_qx = fma(float((v >> 18u) & 0x7u), float(xg[base + 6u]), dot_qx);
+            dot_qx = fma(float((v >> 21u) & 0x7u), float(xg[base + 7u]), dot_qx);
+            sum_x += float(xg[base]) + float(xg[base + 1u]) + float(xg[base + 2u]) + float(xg[base + 3u])
+                   + float(xg[base + 4u]) + float(xg[base + 5u]) + float(xg[base + 6u]) + float(xg[base + 7u]);
+        }
+        acc = fma(scale, dot_qx, acc);
+        acc = fma(bias, sum_x, acc);
+    }
+    return acc;
+}
+
+kernel void prefill_grouped_routed_moe_batched_phase1_b2(
+    device const half*                                   hidden               [[buffer(0)]],
+    device const PrefillTokenExpertPairMSL*              sorted_pairs         [[buffer(1)]],
+    device half*                                         gate_up_act_scratch  [[buffer(7)]],
+    device const PrefillStreamedRoutedBlobsMSL&          routed               [[buffer(9)]],
+    constant PrefillGroupedRoutedMoEStreamedParamsMSL&   p                    [[buffer(10)]],
+    uint2                                                gid                  [[thread_position_in_grid]]
+) {
+    const uint f = gid.x;
+    const uint pair_local = gid.y;
+    if (f >= p.F || pair_local >= p.pair_count) return;
+
+    const PrefillTokenExpertPairMSL pair = sorted_pairs[p.pair_start + pair_local];
+    uint local_slot = kPrefillMaxTileExperts;
+    for (uint slot = 0; slot < p.live_expert_count; ++slot) {
+        if (prefill_streamed_local_expert_id(p, slot) == pair.expert) {
+            local_slot = slot;
+            break;
+        }
+    }
+    if (local_slot >= p.live_expert_count) return;
+
+    device const uint8_t* expert = routed.blob[local_slot];
+    device const half* x = hidden + pair.token * p.hidden_stride_elements;
+    device const uint8_t* gate_W = expert + p.gate_W_off;
+    device const bfloat* gate_s = reinterpret_cast<device const bfloat*>(expert + p.gate_s_off);
+    device const bfloat* gate_b = reinterpret_cast<device const bfloat*>(expert + p.gate_b_off);
+    device const uint8_t* up_W = expert + p.up_W_off;
+    device const bfloat* up_s = reinterpret_cast<device const bfloat*>(expert + p.up_s_off);
+    device const bfloat* up_b = reinterpret_cast<device const bfloat*>(expert + p.up_b_off);
+
+    const float gate = prefill_moe_int2_gemv_row_dev(gate_W, gate_s, gate_b, x, f, p.D);
+    const float up = prefill_moe_int2_gemv_row_dev(up_W, up_s, up_b, x, f, p.D);
+    const uint row_elements = p.pair_count * p.F;
+    const uint index = pair_local * p.F + f;
+    gate_up_act_scratch[index] = half(gate);
+    gate_up_act_scratch[row_elements + index] = half(up);
+    gate_up_act_scratch[2u * row_elements + index] =
+        half(prefill_gelu_pytorch_tanh(gate) * up);
+}
+
+kernel void prefill_grouped_routed_moe_batched_down_b2(
+    device const PrefillTokenExpertPairMSL*              sorted_pairs         [[buffer(1)]],
+    device half*                                         route_partials       [[buffer(5)]],
+    device const half*                                   gate_up_act_scratch  [[buffer(7)]],
+    device half*                                         down_scratch         [[buffer(8)]],
+    device const PrefillStreamedRoutedBlobsMSL&          routed               [[buffer(9)]],
+    constant PrefillGroupedRoutedMoEStreamedParamsMSL&   p                    [[buffer(10)]],
+    uint2                                                gid                  [[thread_position_in_grid]]
+) {
+    const uint d = gid.x;
+    const uint pair_local = gid.y;
+    if (d >= p.D || pair_local >= p.pair_count) return;
+
+    const PrefillTokenExpertPairMSL pair = sorted_pairs[p.pair_start + pair_local];
+    uint local_slot = kPrefillMaxTileExperts;
+    for (uint slot = 0; slot < p.live_expert_count; ++slot) {
+        if (prefill_streamed_local_expert_id(p, slot) == pair.expert) {
+            local_slot = slot;
+            break;
+        }
+    }
+    if (local_slot >= p.live_expert_count) return;
+
+    device const uint8_t* expert = routed.blob[local_slot];
+    device const uint8_t* down_W = expert + p.down_W_off;
+    device const bfloat* down_s = reinterpret_cast<device const bfloat*>(expert + p.down_s_off);
+    device const bfloat* down_b = reinterpret_cast<device const bfloat*>(expert + p.down_b_off);
+    device const half* act = gate_up_act_scratch + 2u * p.pair_count * p.F + pair_local * p.F;
+    const half value = half(prefill_moe_int2_gemv_row_dev(down_W, down_s, down_b, act, d, p.F));
+    down_scratch[pair_local * p.D + d] = value;
+    route_partials[(pair.token * p.top_k + pair.rank) * p.D + d] = value;
+}
+
+kernel void prefill_grouped_routed_moe_batched_phase1_b3(
+    device const half*                                   hidden               [[buffer(0)]],
+    device const PrefillTokenExpertPairMSL*              sorted_pairs         [[buffer(1)]],
+    device half*                                         gate_up_act_scratch  [[buffer(7)]],
+    device const PrefillStreamedRoutedBlobsMSL&          routed               [[buffer(9)]],
+    constant PrefillGroupedRoutedMoEStreamedParamsMSL&   p                    [[buffer(10)]],
+    uint2                                                gid                  [[thread_position_in_grid]]
+) {
+    const uint f = gid.x;
+    const uint pair_local = gid.y;
+    if (f >= p.F || pair_local >= p.pair_count) return;
+
+    const PrefillTokenExpertPairMSL pair = sorted_pairs[p.pair_start + pair_local];
+    uint local_slot = kPrefillMaxTileExperts;
+    for (uint slot = 0; slot < p.live_expert_count; ++slot) {
+        if (prefill_streamed_local_expert_id(p, slot) == pair.expert) {
+            local_slot = slot;
+            break;
+        }
+    }
+    if (local_slot >= p.live_expert_count) return;
+
+    device const uint8_t* expert = routed.blob[local_slot];
+    device const half* x = hidden + pair.token * p.hidden_stride_elements;
+    device const uint8_t* gate_W = expert + p.gate_W_off;
+    device const bfloat* gate_s = reinterpret_cast<device const bfloat*>(expert + p.gate_s_off);
+    device const bfloat* gate_b = reinterpret_cast<device const bfloat*>(expert + p.gate_b_off);
+    device const uint8_t* up_W = expert + p.up_W_off;
+    device const bfloat* up_s = reinterpret_cast<device const bfloat*>(expert + p.up_s_off);
+    device const bfloat* up_b = reinterpret_cast<device const bfloat*>(expert + p.up_b_off);
+
+    const float gate = prefill_moe_int3_gemv_row_dev(gate_W, gate_s, gate_b, x, f, p.D);
+    const float up = prefill_moe_int3_gemv_row_dev(up_W, up_s, up_b, x, f, p.D);
+    const uint row_elements = p.pair_count * p.F;
+    const uint index = pair_local * p.F + f;
+    gate_up_act_scratch[index] = half(gate);
+    gate_up_act_scratch[row_elements + index] = half(up);
+    gate_up_act_scratch[2u * row_elements + index] =
+        half(prefill_gelu_pytorch_tanh(gate) * up);
+}
+
+kernel void prefill_grouped_routed_moe_batched_down_b3(
+    device const PrefillTokenExpertPairMSL*              sorted_pairs         [[buffer(1)]],
+    device half*                                         route_partials       [[buffer(5)]],
+    device const half*                                   gate_up_act_scratch  [[buffer(7)]],
+    device half*                                         down_scratch         [[buffer(8)]],
+    device const PrefillStreamedRoutedBlobsMSL&          routed               [[buffer(9)]],
+    constant PrefillGroupedRoutedMoEStreamedParamsMSL&   p                    [[buffer(10)]],
+    uint2                                                gid                  [[thread_position_in_grid]]
+) {
+    const uint d = gid.x;
+    const uint pair_local = gid.y;
+    if (d >= p.D || pair_local >= p.pair_count) return;
+
+    const PrefillTokenExpertPairMSL pair = sorted_pairs[p.pair_start + pair_local];
+    uint local_slot = kPrefillMaxTileExperts;
+    for (uint slot = 0; slot < p.live_expert_count; ++slot) {
+        if (prefill_streamed_local_expert_id(p, slot) == pair.expert) {
+            local_slot = slot;
+            break;
+        }
+    }
+    if (local_slot >= p.live_expert_count) return;
+
+    device const uint8_t* expert = routed.blob[local_slot];
+    device const uint8_t* down_W = expert + p.down_W_off;
+    device const bfloat* down_s = reinterpret_cast<device const bfloat*>(expert + p.down_s_off);
+    device const bfloat* down_b = reinterpret_cast<device const bfloat*>(expert + p.down_b_off);
+    device const half* act = gate_up_act_scratch + 2u * p.pair_count * p.F + pair_local * p.F;
+    const half value = half(prefill_moe_int3_gemv_row_dev(down_W, down_s, down_b, act, d, p.F));
+    down_scratch[pair_local * p.D + d] = value;
+    route_partials[(pair.token * p.top_k + pair.rank) * p.D + d] = value;
+}

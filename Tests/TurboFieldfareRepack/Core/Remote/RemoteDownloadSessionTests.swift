@@ -44,7 +44,8 @@ struct RemoteDownloadSessionTests {
         original.setValue("Bearer secret", forHTTPHeaderField: "Authorization")
         var policy = RemoteMetadataRedirectPolicy(
             originalRequest: original,
-            maximumRedirects: 2)
+            maximumRedirects: 2,
+            followRedirects: true)
 
         let sameHost = policy.request(proposedRequest: URLRequest(
             url: URL(string: "https://hf.test/api/cache/file?etag=value")!))

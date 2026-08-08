@@ -83,7 +83,7 @@ public struct HuggingFaceRemoteSource: Sendable {
         var request = URLRequest(url: url)
         request.httpMethod = "HEAD"
         applyHeaders(to: &request)
-        let (_, response) = try await downloadSession.response(for: request)
+        let (_, response) = try await downloadSession.response(for: request, followRedirects: false)
         guard let http = response as? HTTPURLResponse else {
             throw RepackError.remoteProtocolInvalid(detail: "missing HTTP response for \(filename)")
         }
@@ -93,11 +93,18 @@ public struct HuggingFaceRemoteSource: Sendable {
                 status: http.statusCode,
                 retryAfter: remoteHeader(http, "Retry-After"))
         }
-        let commit = remoteHeader(http, "X-Repo-Commit") ?? resolvedCommit
+        let commit = remoteHeader(http, "X-Repo-Commit")
+            ?? resolvedCommit
+            ?? fullLengthCommit(requestedRevision)
         guard let commit, commit.count == 40 else {
             throw RepackError.remoteProtocolInvalid(detail: "missing full X-Repo-Commit for \(filename)")
         }
-        let size = try remoteSize(http: http, filename: filename)
+        let size: UInt64
+        do {
+            size = try remoteSize(http: http, filename: filename)
+        } catch {
+            size = try await resolveFileSizeViaRangeProbe(filename: filename, commit: commit)
+        }
         let etag = remoteHeader(http, "X-Linked-ETag") ?? remoteHeader(http, "ETag")
         return RemoteFileInfo(filename: filename,
                               resolvedCommit: commit,
@@ -106,6 +113,23 @@ public struct HuggingFaceRemoteSource: Sendable {
                               xetHash: remoteHeader(http, "X-Xet-Hash"),
                               acceptsRanges: (remoteHeader(http, "Accept-Ranges") ?? "")
                                   .lowercased().contains("bytes"))
+    }
+
+    private func resolveFileSizeViaRangeProbe(filename: String, commit: String) async throws -> UInt64 {
+        let url = try pinned(commit: commit).fileURL(filename: filename)
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue("bytes=0-0", forHTTPHeaderField: "Range")
+        request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
+        applyHeaders(to: &request)
+        let (_, response) = try await downloadSession.response(for: request, followRedirects: false)
+        guard let http = response as? HTTPURLResponse else {
+            throw RepackError.remoteProtocolInvalid(detail: "missing HTTP response for \(filename) range probe")
+        }
+        if let size = contentRangeTotal(http) {
+            return size
+        }
+        return try remoteSize(http: http, filename: filename)
     }
 
     public func fetchSmallFile(filename: String,
@@ -212,6 +236,11 @@ public struct HuggingFaceRemoteSource: Sendable {
     }
 }
 
+private func fullLengthCommit(_ value: String?) -> String? {
+    guard let value, value.count == 40 else { return nil }
+    return value
+}
+
 private func validateRepoID(_ repoID: String) throws {
     let parts = repoID.split(separator: "/")
     guard parts.count == 2, parts.allSatisfy({ !$0.isEmpty && !$0.contains("..") }) else {
@@ -230,6 +259,9 @@ private func validateFilename(_ filename: String) throws {
 }
 
 private func remoteSize(http: HTTPURLResponse, filename: String) throws -> UInt64 {
+    if let size = contentRangeTotal(http) {
+        return size
+    }
     if let linked = remoteHeader(http, "X-Linked-Size"), let size = UInt64(linked) {
         return size
     }
@@ -239,4 +271,11 @@ private func remoteSize(http: HTTPURLResponse, filename: String) throws -> UInt6
         return size
     }
     throw RepackError.remoteProtocolInvalid(detail: "missing remote size for \(filename)")
+}
+
+private func contentRangeTotal(_ http: HTTPURLResponse) -> UInt64? {
+    guard let contentRange = remoteHeader(http, "Content-Range") else { return nil }
+    guard let slashIndex = contentRange.lastIndex(of: "/") else { return nil }
+    let total = contentRange[contentRange.index(after: slashIndex)...]
+    return UInt64(total)
 }

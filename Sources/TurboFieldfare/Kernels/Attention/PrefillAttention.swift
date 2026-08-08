@@ -48,7 +48,7 @@ final class PrefillAttention {
     init(context: MetalContext) throws {
         self.context = context
         self.psoCausalTiled = try context.pipeline("attention_prefill_causal_tiled")
-        self.psoFullTensorOps2DValidityV2 = context.device.supportsFamily(.apple10)
+        self.psoFullTensorOps2DValidityV2 = context.device.supportsFamily(.apple9)
             ? try? context.pipeline("attention_prefill_full_tensorops_2d_validity_v2")
             : nil
     }

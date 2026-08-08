@@ -110,7 +110,8 @@ enum GTurboJSON {
             var experts: [[String: Any]] = []
             experts.reserveCapacity(lp.expertsPerLayer)
             for e in 0..<lp.expertsPerLayer {
-                let base = UInt64(e) * lp.expertStride
+                let physicalRank = lp.physicalRank(for: e)
+                let base = UInt64(physicalRank) * lp.expertStride
                 var tensors: [String: Any] = [:]
                 for slice in lp.subTensors {
                     let key: String
@@ -131,6 +132,7 @@ enum GTurboJSON {
                 }
                 let expertEntry: [String: Any] = [
                     "expert": e,
+                    "physicalRank": physicalRank,
                     "offset": base,
                     "size":   lp.expertStride,
                     "tensors": tensors

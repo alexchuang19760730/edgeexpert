@@ -15,6 +15,7 @@ enum GTurboLayoutValidator {
             }
             if planLayer.expertsPerLayer == 0 { continue }
             var seenLogical = Set<Int>()
+            var seenPhysical = Set<Int>()
             var seenOffsets = Set<UInt64>()
             for expertObj in experts {
                 guard let expert = expertObj["expert"] as? Int,
@@ -34,10 +35,19 @@ enum GTurboLayoutValidator {
                 guard offset % Layout.pageBytes == 0 else {
                     throw RepackError.configurationInvalid(detail: "layout.json validation failed: unaligned offset \(offset)")
                 }
-                let expected = UInt64(expert) * planLayer.expertStride
+                let physicalRank = expertObj["physicalRank"] as? Int ?? expert
+                guard physicalRank >= 0 && physicalRank < planLayer.expertsPerLayer else {
+                    throw RepackError.configurationInvalid(detail:
+                        "layout.json validation failed: physicalRank \(physicalRank) out of range")
+                }
+                guard seenPhysical.insert(physicalRank).inserted else {
+                    throw RepackError.configurationInvalid(detail:
+                        "layout.json validation failed: duplicate physicalRank \(physicalRank)")
+                }
+                let expected = UInt64(physicalRank) * planLayer.expertStride
                 guard offset == expected else {
                     throw RepackError.configurationInvalid(detail:
-                        "layout.json validation failed: offset \(offset) != expert * stride \(expected)")
+                        "layout.json validation failed: offset \(offset) != physicalRank * stride \(expected)")
                 }
                 guard size == planLayer.expertStride,
                       offset + size <= planLayer.fileSize else {
@@ -48,6 +58,10 @@ enum GTurboLayoutValidator {
             guard seenLogical.count == planLayer.expertsPerLayer else {
                 throw RepackError.configurationInvalid(detail:
                     "layout.json validation failed: missing experts in layer \(layerIndex)")
+            }
+            guard seenPhysical.count == planLayer.expertsPerLayer else {
+                throw RepackError.configurationInvalid(detail:
+                    "layout.json validation failed: missing physical ranks in layer \(layerIndex)")
             }
         }
     }

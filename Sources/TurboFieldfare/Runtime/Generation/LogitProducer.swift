@@ -15,6 +15,24 @@ public protocol ContinuableLogitProducer: LogitProducer {
     func prepareForContinuation(expectedPosition: Int) throws
 }
 
+public protocol RequestAwareLogitProducer: LogitProducer {
+    func beginRequest()
+    func beginPrefillPhase()
+    func beginDecodePhase()
+    func setDecodeStep(index: Int)
+}
+
+extension RequestAwareLogitProducer {
+    public func beginRequest() {}
+    public func beginPrefillPhase() {}
+    public func beginDecodePhase() {}
+    public func setDecodeStep(index _: Int) {}
+}
+
+public protocol ExpertCacheTelemetryReporting: Sendable {
+    var routedExpertCacheTelemetrySnapshots: [RoutedExpertCacheLayerTelemetrySnapshot] { get }
+}
+
 protocol ContextWindowReporting: Sendable {
     var maxContext: Int { get }
 }

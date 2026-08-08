@@ -19,8 +19,19 @@ public enum RuntimeExpertCachePolicy: String, Codable, Sendable {
     case lru
 }
 
+public enum RuntimePrefillExpertReadMode: String, Codable, Sendable, Equatable {
+    case baseline
+    case coalesced
+    case layerLocalReadahead = "layer-local-readahead"
+}
+
 public struct RuntimeConfiguration: Sendable, Equatable {
-    public static let allowedExpertCacheSlots = [8, 16, 24, 32]
+    /// Slots are per layer, so resident expert bytes scale as
+    /// `slots * layers * expertStride` (3.2MB stride over 30 layers is ~96MB
+    /// per slot). The large values only pay off on machines that can hold the
+    /// hot working set; a trace-driven replay showed LRU hit rate climbing
+    /// 57.6% -> 81.5% -> ~93% across 16 -> 32 -> 128 slots.
+    public static let allowedExpertCacheSlots = [8, 16, 24, 32, 48, 64, 96, 128]
     public static let allowedPrefillChunkTokens = [32, 64, 128]
 
     public let expertCacheSlots: Int
@@ -29,6 +40,10 @@ public struct RuntimeConfiguration: Sendable, Equatable {
     public let prefillPolicy: RuntimePrefillPolicy
     public let prefillChunkTokens: Int
     public let prefillAttentionPath: RuntimePrefillAttentionPath
+    public let prefillExpertReadMode: RuntimePrefillExpertReadMode
+    public let prefillExpertLayerLocalReadaheadExperts: Int
+    public let prefillExpertBoundedCoalescedRunExperts: Int
+    public let prefillExpertBoundedParallelMissReadWorkers: Int
     public let headPath: RuntimeHeadPath
 
     public init(expertCacheSlots: Int = 16,
@@ -37,17 +52,31 @@ public struct RuntimeConfiguration: Sendable, Equatable {
                 prefillEnabled: Bool = true,
                 prefillChunkTokens: Int = 128,
                 prefillAttentionPath: RuntimePrefillAttentionPath = .fullTensorOps2DPreferred,
+                prefillExpertReadMode: RuntimePrefillExpertReadMode = .baseline,
+                prefillExpertLayerLocalReadaheadExperts: Int = 16,
+                prefillExpertBoundedCoalescedRunExperts: Int = 4,
+                prefillExpertBoundedParallelMissReadWorkers: Int = 2,
                 forceLogitsHead: Bool = false) {
         precondition(Self.allowedExpertCacheSlots.contains(expertCacheSlots),
                      "unsupported expert-cache slot count")
         precondition(Self.allowedPrefillChunkTokens.contains(prefillChunkTokens),
                      "unsupported prefill chunk size")
+        precondition(prefillExpertLayerLocalReadaheadExperts > 0,
+                     "prefill expert layer-local readahead experts must be positive")
+        precondition(prefillExpertBoundedCoalescedRunExperts > 0,
+                     "prefill expert bounded coalesced run experts must be positive")
+        precondition(prefillExpertBoundedParallelMissReadWorkers > 0,
+                     "prefill expert bounded parallel miss read workers must be positive")
         self.expertCacheSlots = expertCacheSlots
         self.expertCachePolicy = expertCachePolicy
         self.rdadvisePolicy = rdadvisePolicy
         self.prefillPolicy = prefillEnabled ? .chunked : .off
         self.prefillChunkTokens = prefillChunkTokens
         self.prefillAttentionPath = prefillAttentionPath
+        self.prefillExpertReadMode = prefillExpertReadMode
+        self.prefillExpertLayerLocalReadaheadExperts = prefillExpertLayerLocalReadaheadExperts
+        self.prefillExpertBoundedCoalescedRunExperts = prefillExpertBoundedCoalescedRunExperts
+        self.prefillExpertBoundedParallelMissReadWorkers = prefillExpertBoundedParallelMissReadWorkers
         self.headPath = forceLogitsHead ? .logits : .fusedRows
     }
 

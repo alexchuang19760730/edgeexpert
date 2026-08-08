@@ -35,6 +35,11 @@ final class MoE {
     private static let realDecodeF: UInt32 = 704
     private static let realDecodeTopK: UInt32 = 8
     private static let realDecodeNumExperts: UInt32 = 128
+    /// Matches kMoEPhase2MaxChunk in moe.metal: the chunked phase-2 kernel
+    /// clamps `chunk` internally, so the Swift-side grid MUST use the same
+    /// clamped value or a too-large env chunk would dispatch too few TGs and
+    /// silently leave the tail of y unwritten.
+    private static let maxPhase2Chunk: UInt32 = 64
     private static let realDecodeMoEConstants: [MetalFunctionConstant] = [
         MetalFunctionConstant(index: 0, value: .uint32(realDecodeD)),
         MetalFunctionConstant(index: 1, value: .uint32(realDecodeF)),
@@ -59,6 +64,14 @@ final class MoE {
     private let phase1SubsetU16SpecializedPSO: MTLComputePipelineState
     private let phase2ReduceK8PSO: MTLComputePipelineState
     private let phase2ReduceK8SpecializedPSO: MTLComputePipelineState
+    private let phase2ChunkedPSO: MTLComputePipelineState
+    private let phase2ChunkedSpecializedPSO: MTLComputePipelineState
+    private var bitsPhase1PSO: [Int: MTLComputePipelineState] = [:]
+    private var bitsPhase1SpecializedPSO: [Int: MTLComputePipelineState] = [:]
+    private var bitsPhase1SubsetPSO: [Int: MTLComputePipelineState] = [:]
+    private var bitsPhase1SubsetSpecializedPSO: [Int: MTLComputePipelineState] = [:]
+    private var bitsPhase2PSO: [Int: MTLComputePipelineState] = [:]
+    private var bitsPhase2SpecializedPSO: [Int: MTLComputePipelineState] = [:]
     private let routedArgEncoder: MTLArgumentEncoder
     private let reusableRoutedArgBuffer: MTLBuffer
 
@@ -88,6 +101,31 @@ final class MoE {
         self.phase2ReduceK8SpecializedPSO = try context.pipeline(
             "moe_phase2_down_reduce_k8",
             constants: Self.realDecodeMoEConstants)
+        self.phase2ChunkedPSO = try context.pipeline("moe_phase2_down_reduce_k8_chunked")
+        self.phase2ChunkedSpecializedPSO = try context.pipeline(
+            "moe_phase2_down_reduce_k8_chunked",
+            constants: Self.realDecodeMoEConstants)
+        // 2/3-bit routed-expert variants (weightBits = 2 | 3).
+        for bits in [2, 3] {
+            self.bitsPhase1PSO[bits] = try context.pipeline(
+                "moe_phase1_gate_up_act_b\(bits)",
+                constants: [],
+                maxTotalThreadsPerThreadgroup: 512)
+            self.bitsPhase1SpecializedPSO[bits] = try context.pipeline(
+                "moe_phase1_gate_up_act_b\(bits)",
+                constants: Self.realDecodeMoEConstants,
+                maxTotalThreadsPerThreadgroup: 512)
+            self.bitsPhase1SubsetPSO[bits] = try context.pipeline(
+                "moe_phase1_gate_up_act_subset_b\(bits)")
+            self.bitsPhase1SubsetSpecializedPSO[bits] = try context.pipeline(
+                "moe_phase1_gate_up_act_subset_b\(bits)",
+                constants: Self.realDecodeMoEConstants)
+            self.bitsPhase2PSO[bits] = try context.pipeline(
+                "moe_phase2_down_reduce_b\(bits)")
+            self.bitsPhase2SpecializedPSO[bits] = try context.pipeline(
+                "moe_phase2_down_reduce_b\(bits)",
+                constants: Self.realDecodeMoEConstants)
+        }
 
         guard let logits = context.device.makeBuffer(
             length: 256 * MemoryLayout<Float>.stride,
@@ -158,10 +196,26 @@ final class MoE {
         }
     }
 
-    func makeRoutedArgumentBuffer(routedBlobs: [MTLBuffer],
+    typealias RoutedBlob = (buffer: MTLBuffer, offset: UInt64)
+
+    /// The GPU residency pass for file-backed bytesNoCopy buffers costs ~85us
+    /// per buffer. In mmap mode every blob is the same stream buffer, so
+    /// collapse the array to unique objects before useResources — one
+    /// residency registration per command buffer instead of per expert.
+    private static func uniqueBlobBuffers(_ blobs: [RoutedBlob]) -> [MTLBuffer] {
+        var seen = Set<ObjectIdentifier>()
+        return blobs.compactMap { blob in
+            let id = ObjectIdentifier(blob.buffer)
+            guard !seen.contains(id) else { return nil }
+            seen.insert(id)
+            return blob.buffer
+        }
+    }
+
+    func makeRoutedArgumentBuffer(routedBlobs: [RoutedBlob],
                                          topK: UInt32) -> MTLBuffer? {
         validate(routedBlobs: routedBlobs, topK: topK)
-        guard let buffer = routedBlobs.first?.device.makeBuffer(
+        guard let buffer = routedBlobs.first?.buffer.device.makeBuffer(
             length: routedArgEncoder.encodedLength,
             options: .storageModeShared) else {
             return nil
@@ -170,7 +224,7 @@ final class MoE {
         return buffer
     }
 
-    func makeReusedRoutedArgumentBuffer(routedBlobs: [MTLBuffer],
+    func makeReusedRoutedArgumentBuffer(routedBlobs: [RoutedBlob],
                                                topK: UInt32) -> MTLBuffer {
         validate(routedBlobs: routedBlobs, topK: topK)
         encodeRoutedArgumentBuffer(reusableRoutedArgBuffer, routedBlobs: routedBlobs)
@@ -180,13 +234,14 @@ final class MoE {
     func encodeRoutedPersistentPhase1U16Load(
         commandBuffer: MTLCommandBuffer,
         routedArgBuffer: MTLBuffer,
-        routedBlobs: [MTLBuffer],
+        routedBlobs: [RoutedBlob],
         routedOffsets: MoEExpertOffsets,
         x: MTLBuffer,
         acts: MTLBuffer,
         d: UInt32,
         f: UInt32,
-        topK: UInt32
+        topK: UInt32,
+        bits: Int = 4
     ) {
         validate(routedBlobs: routedBlobs, topK: topK)
         var dimension = d
@@ -194,11 +249,9 @@ final class MoE {
         var expertCount = topK
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         encoder.setComputePipelineState(
-            useRealDecodeConstants(d: d, f: f)
-                ? phase1U16SpecializedPSO
-                : phase1U16PSO)
+            phase1PSO(specialized: useRealDecodeConstants(d: d, f: f), bits: bits))
         encoder.setBuffer(routedArgBuffer, offset: 0, index: 0)
-        for buffer in routedBlobs { encoder.useResource(buffer, usage: .read) }
+        encoder.useResources(Self.uniqueBlobBuffers(routedBlobs), usage: .read)
         var offsets = routedOffsets
         encoder.setBytes(&offsets, length: MemoryLayout<MoEExpertOffsets>.stride, index: 1)
         encoder.setBuffer(x, offset: 0, index: 2)
@@ -215,7 +268,7 @@ final class MoE {
     func encodeRoutedPersistentPhase1SubsetU16Load(
         commandBuffer: MTLCommandBuffer,
         routedArgBuffer: MTLBuffer,
-        routedBlobs: [MTLBuffer],
+        routedBlobs: [RoutedBlob],
         routedOffsets: MoEExpertOffsets,
         x: MTLBuffer,
         acts: MTLBuffer,
@@ -224,7 +277,8 @@ final class MoE {
         activeCount: UInt32,
         d: UInt32,
         f: UInt32,
-        topK: UInt32
+        topK: UInt32,
+        bits: Int = 4
     ) {
         guard activeCount > 0 else { return }
         validate(routedBlobs: routedBlobs, topK: topK)
@@ -235,13 +289,11 @@ final class MoE {
         var active = activeCount
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         encoder.setComputePipelineState(
-            useRealDecodeConstants(d: d, f: f)
-                ? phase1SubsetU16SpecializedPSO
-                : phase1SubsetU16PSO)
+            phase1SubsetPSO(specialized: useRealDecodeConstants(d: d, f: f), bits: bits))
         encoder.setBuffer(routedArgBuffer, offset: 0, index: 0)
-        for slot in activeSlotIndices {
-            encoder.useResource(routedBlobs[Int(slot)], usage: .read)
-        }
+        encoder.useResources(
+            Self.uniqueBlobBuffers(activeSlotIndices.map { routedBlobs[Int($0)] }),
+            usage: .read)
         var offsets = routedOffsets
         encoder.setBytes(&offsets, length: MemoryLayout<MoEExpertOffsets>.stride, index: 1)
         encoder.setBuffer(x, offset: 0, index: 2)
@@ -260,7 +312,7 @@ final class MoE {
     func encodeRoutedPersistentPhase2Reduce(
         commandBuffer: MTLCommandBuffer,
         routedArgBuffer: MTLBuffer,
-        routedBlobs: [MTLBuffer],
+        routedBlobs: [RoutedBlob],
         routedOffsets: MoEExpertOffsets,
         acts: MTLBuffer,
         routingWeights: MTLBuffer,
@@ -268,18 +320,26 @@ final class MoE {
         y: MTLBuffer,
         d: UInt32,
         f: UInt32,
-        topK: UInt32
+        topK: UInt32,
+        bits: Int = 4,
+        chunk: UInt32 = 1
     ) {
         validate(routedBlobs: routedBlobs, topK: topK)
         var dimension = d
         var intermediate = f
+        // F > 1024 would read past the 16KB acts smem copy (kMoEPhase2MaxActs).
+        let useChunked = chunk > 1 && bits == 4 && Int(f) <= 1024
+        var chunkValue = useChunked ? min(chunk, Self.maxPhase2Chunk) : 1
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
-        encoder.setComputePipelineState(
-            useRealDecodeConstants(d: d, f: f)
-                ? phase2ReduceK8SpecializedPSO
-                : phase2ReduceK8PSO)
+        if useChunked {
+            encoder.setComputePipelineState(
+                useRealDecodeConstants(d: d, f: f) ? phase2ChunkedSpecializedPSO : phase2ChunkedPSO)
+        } else {
+            encoder.setComputePipelineState(
+                phase2PSO(specialized: useRealDecodeConstants(d: d, f: f), bits: bits))
+        }
         encoder.setBuffer(routedArgBuffer, offset: 0, index: 0)
-        for buffer in routedBlobs { encoder.useResource(buffer, usage: .read) }
+        encoder.useResources(Self.uniqueBlobBuffers(routedBlobs), usage: .read)
         var offsets = routedOffsets
         encoder.setBytes(&offsets, length: MemoryLayout<MoEExpertOffsets>.stride, index: 1)
         encoder.setBuffer(acts, offset: 0, index: 2)
@@ -288,22 +348,63 @@ final class MoE {
         encoder.setBuffer(y, offset: 0, index: 5)
         encoder.setBytes(&dimension, length: MemoryLayout<UInt32>.stride, index: 6)
         encoder.setBytes(&intermediate, length: MemoryLayout<UInt32>.stride, index: 7)
-        encoder.dispatchThreadgroups(
-            MTLSize(width: Int(d), height: 1, depth: 1),
-            threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        if useChunked {
+            encoder.setBytes(&chunkValue, length: MemoryLayout<UInt32>.stride, index: 8)
+            encoder.dispatchThreadgroups(
+                MTLSize(width: Int((d + chunkValue - 1) / chunkValue), height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        } else {
+            encoder.dispatchThreadgroups(
+                MTLSize(width: Int(d), height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        }
         encoder.endEncoding()
     }
 
-    private func validate(routedBlobs: [MTLBuffer], topK: UInt32) {
+    /// Pick the routed-expert decode PSO for a given weight bit width.
+    /// `bits == 4` uses the original kernels; 2/3 use the A/B variants.
+    private func phase1PSO(specialized: Bool, bits: Int) -> MTLComputePipelineState {
+        switch bits {
+        case 2, 3:
+            return specialized ? bitsPhase1SpecializedPSO[bits]! : bitsPhase1PSO[bits]!
+        default:
+            return specialized ? phase1U16SpecializedPSO : phase1U16PSO
+        }
+    }
+
+    private func phase1SubsetPSO(specialized: Bool, bits: Int) -> MTLComputePipelineState {
+        switch bits {
+        case 2, 3:
+            return specialized ? bitsPhase1SubsetSpecializedPSO[bits]! : bitsPhase1SubsetPSO[bits]!
+        default:
+            return specialized ? phase1SubsetU16SpecializedPSO : phase1SubsetU16PSO
+        }
+    }
+
+    private func phase2PSO(specialized: Bool, bits: Int) -> MTLComputePipelineState {
+        switch bits {
+        case 2, 3:
+            return specialized ? bitsPhase2SpecializedPSO[bits]! : bitsPhase2PSO[bits]!
+        default:
+            return specialized ? phase2ReduceK8SpecializedPSO : phase2ReduceK8PSO
+        }
+    }
+
+    private func validate(routedBlobs: [RoutedBlob], topK: UInt32) {
         precondition(topK == UInt32(Self.maxStreamedExperts))
         precondition(routedBlobs.count == Int(topK))
     }
 
     private func encodeRoutedArgumentBuffer(_ buffer: MTLBuffer,
-                                            routedBlobs: [MTLBuffer]) {
+                                            routedBlobs: [RoutedBlob]) {
         routedArgEncoder.setArgumentBuffer(buffer, offset: 0)
         for (index, blob) in routedBlobs.enumerated() {
-            routedArgEncoder.setBuffer(blob, offset: 0, index: index)
+            // Per-expert base address = stream buffer + expert offset (mmap)
+            // or slot buffer + 0 (pread). The kernel's `blob[slot]` pointers
+            // resolve to exactly the expert's window either way.
+            routedArgEncoder.setBuffer(blob.buffer,
+                                       offset: Int(blob.offset),
+                                       index: index)
         }
     }
 

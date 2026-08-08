@@ -9,20 +9,25 @@ public enum SupportedModelSource {
     public static let approximateDownloadBytes: UInt64 = 14_620_479_420
     public static let installedBytes: UInt64 = 14_291_921_884
     public static let reserveBytes: UInt64 = 1_073_741_824
+    public static let defaultBaseURL = URL(string: "https://huggingface.co")!
 
     public static func installOptions(outputDirectory: URL,
                                       overwrite: Bool,
                                       token: String?,
-                                      resume: Bool = false)
+                                      expertLayoutOrder: ExpertLayoutOrder? = nil,
+                                      resume: Bool = false,
+                                      baseURL: URL = defaultBaseURL)
         -> RemoteStreamingRepackOptions {
         RemoteStreamingRepackOptions(
             repoID: repoID,
             revision: revision,
             outputDir: outputDirectory.path,
+            expertLayoutOrder: expertLayoutOrder,
             token: token,
             requireKnownSource: true,
             minFreeReserveBytes: reserveBytes,
             overwrite: overwrite,
-            resume: resume)
+            resume: resume,
+            baseURL: baseURL)
     }
 }

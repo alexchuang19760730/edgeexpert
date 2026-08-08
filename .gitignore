@@ -48,3 +48,6 @@ tmp/
 __pycache__/
 *.pyc
 .venv/
+
+# 编译出的 CLI 二进位（A/B 用，不入库）
+bin/TurboFieldfareCLI-*

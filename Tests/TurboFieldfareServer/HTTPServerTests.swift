@@ -24,7 +24,7 @@ private actor ScriptedServerBackend: ServerInferenceBackend {
             content: "hello",
             toolCalls: [],
             finishReason: "stop",
-            usage: OpenAIUsage(promptTokens: 3, completionTokens: 1, totalTokens: 4))
+            usage: OpenAIUsage(promptTokens: 3, completionTokens: 1, totalTokens: 4), prefillMs: 0, decodeMs: 0)
     }
 }
 
@@ -49,7 +49,7 @@ private actor MultipleToolBackend: ServerInferenceBackend {
             content: "",
             toolCalls: [first, second],
             finishReason: "tool_calls",
-            usage: OpenAIUsage(promptTokens: 3, completionTokens: 8, totalTokens: 11))
+            usage: OpenAIUsage(promptTokens: 3, completionTokens: 8, totalTokens: 11), prefillMs: 0, decodeMs: 0)
     }
 }
 
@@ -70,7 +70,7 @@ private actor ContentAndToolBackend: ServerInferenceBackend {
             content: content,
             toolCalls: [call],
             finishReason: "tool_calls",
-            usage: OpenAIUsage(promptTokens: 3, completionTokens: 8, totalTokens: 11))
+            usage: OpenAIUsage(promptTokens: 3, completionTokens: 8, totalTokens: 11), prefillMs: 0, decodeMs: 0)
     }
 }
 
@@ -96,7 +96,7 @@ private actor PipelinedRequestBackend: ServerInferenceBackend {
             content: "first",
             toolCalls: [],
             finishReason: "stop",
-            usage: OpenAIUsage(promptTokens: 3, completionTokens: 1, totalTokens: 4))
+            usage: OpenAIUsage(promptTokens: 3, completionTokens: 1, totalTokens: 4), prefillMs: 0, decodeMs: 0)
     }
 }
 
@@ -119,7 +119,7 @@ private actor CancellableServerBackend: ServerInferenceBackend {
             content: "unexpected",
             toolCalls: [],
             finishReason: "stop",
-            usage: OpenAIUsage(promptTokens: 1, completionTokens: 1, totalTokens: 2))
+            usage: OpenAIUsage(promptTokens: 1, completionTokens: 1, totalTokens: 2), prefillMs: 0, decodeMs: 0)
     }
 }
 
@@ -147,7 +147,7 @@ private actor QueueHeartbeatBackend: ServerInferenceBackend {
             content: "hello",
             toolCalls: [],
             finishReason: "stop",
-            usage: OpenAIUsage(promptTokens: 3, completionTokens: 1, totalTokens: 4))
+            usage: OpenAIUsage(promptTokens: 3, completionTokens: 1, totalTokens: 4), prefillMs: 0, decodeMs: 0)
     }
 }
 
@@ -180,7 +180,7 @@ private actor CancellationIgnoringPreparationBackend: ServerInferenceBackend {
             content: "unexpected",
             toolCalls: [],
             finishReason: "stop",
-            usage: OpenAIUsage(promptTokens: 1, completionTokens: 1, totalTokens: 2))
+            usage: OpenAIUsage(promptTokens: 1, completionTokens: 1, totalTokens: 2), prefillMs: 0, decodeMs: 0)
     }
 }
 
@@ -215,7 +215,7 @@ private actor PreflightRejectingServerBackend: ServerInferenceBackend {
             content: "unexpected",
             toolCalls: [],
             finishReason: "stop",
-            usage: OpenAIUsage(promptTokens: 1, completionTokens: 1, totalTokens: 2))
+            usage: OpenAIUsage(promptTokens: 1, completionTokens: 1, totalTokens: 2), prefillMs: 0, decodeMs: 0)
     }
 }
 
@@ -250,7 +250,7 @@ private actor AdmissionBlockingPreparationBackend: ServerInferenceBackend {
             content: "ready",
             toolCalls: [],
             finishReason: "stop",
-            usage: OpenAIUsage(promptTokens: 1, completionTokens: 1, totalTokens: 2))
+            usage: OpenAIUsage(promptTokens: 1, completionTokens: 1, totalTokens: 2), prefillMs: 0, decodeMs: 0)
     }
 }
 

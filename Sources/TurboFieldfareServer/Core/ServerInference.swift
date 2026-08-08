@@ -12,15 +12,30 @@ public struct ServerCompletion: Equatable, Sendable {
     public let toolCalls: [ParsedToolCall]
     public let finishReason: String
     public let usage: OpenAIUsage
+    public let prefillMs: Double
+    public let decodeMs: Double
+    public let prefillTimingBreakdown: PrefillTimingBreakdown?
+    public let prefillExpertAccessPattern: PrefillExpertAccessPattern?
+    public let routedExpertCacheTelemetrySnapshots: [RoutedExpertCacheLayerTelemetrySnapshot]
 
     public init(content: String,
                 toolCalls: [ParsedToolCall],
                 finishReason: String,
-                usage: OpenAIUsage) {
+                usage: OpenAIUsage,
+                prefillMs: Double,
+                decodeMs: Double,
+                prefillTimingBreakdown: PrefillTimingBreakdown? = nil,
+                 prefillExpertAccessPattern: PrefillExpertAccessPattern? = nil,
+                routedExpertCacheTelemetrySnapshots: [RoutedExpertCacheLayerTelemetrySnapshot] = []) {
         self.content = content
         self.toolCalls = toolCalls
         self.finishReason = finishReason
         self.usage = usage
+        self.prefillMs = prefillMs
+        self.decodeMs = decodeMs
+        self.prefillTimingBreakdown = prefillTimingBreakdown
+        self.prefillExpertAccessPattern = prefillExpertAccessPattern
+        self.routedExpertCacheTelemetrySnapshots = routedExpertCacheTelemetrySnapshots
     }
 }
 
@@ -160,12 +175,24 @@ public actor ServerModelSession: ServerInferenceBackend {
     private let prefillConfig: PrefillRuntimeConfig
     private let maxContext: Int
     private let promptCacheMode: ServerPromptCacheMode
+    private let diagnosticsMode: ServerDiagnosticsMode
     private let promptCacheDomain: ServerPromptCacheDomain
+    private let prefillExpertTraceWriter: ServerPrefillExpertTraceWriter?
     private var promptCache = ServerPromptCache()
 
     public static func load(modelDirectory: URL,
                             maxContext: Int,
-                            promptCacheMode: ServerPromptCacheMode = .singlePrefix) async throws -> ServerModelSession {
+                            expertStreamingMode: ServerExpertStreamingMode = .pread,
+                            pdServiceMode: ServerPDServiceMode = .on,
+                            promptCacheMode: ServerPromptCacheMode = .singlePrefix,
+                            promptCachePrimingMode: ServerPromptCachePrimingMode = .off,
+                            stickyQuotaMode: ServerStickyQuotaMode = .on,
+                            diagnosticsMode: ServerDiagnosticsMode = .on,
+                            prefillExpertReadMode: ServerPrefillExpertReadMode = .baseline,
+                            prefillExpertLayerLocalReadaheadExperts: Int = 16,
+                            prefillExpertBoundedCoalescedRunExperts: Int = 4,
+                            prefillExpertBoundedParallelMissReadWorkers: Int = 2,
+                            prefillExpertTraceOutput: String? = nil) async throws -> ServerModelSession {
         let tokenizerFolder = GFTokenizer.tokenizerFolder(forModelDirectory: modelDirectory)
         guard let tokenizerFolder else {
             throw GFTokenizerError.missingToolTemplate
@@ -176,12 +203,37 @@ public actor ServerModelSession: ServerInferenceBackend {
         }
         let tokenizer = try await GFTokenizer.load(from: tokenizerFolder)
         let context = try MetalContext()
-        let runtime = RuntimeConfiguration(forceLogitsHead: true)
+        let runtime = RuntimeConfiguration(
+            prefillExpertReadMode: {
+                switch prefillExpertReadMode {
+                case .baseline: .baseline
+                case .coalesced: .coalesced
+                case .layerLocalReadahead: .layerLocalReadahead
+                }
+            }(),
+            prefillExpertLayerLocalReadaheadExperts: prefillExpertLayerLocalReadaheadExperts,
+            prefillExpertBoundedCoalescedRunExperts: prefillExpertBoundedCoalescedRunExperts,
+            prefillExpertBoundedParallelMissReadWorkers: prefillExpertBoundedParallelMissReadWorkers,
+            forceLogitsHead: true)
+        let effectiveStreamingMode: ExpertStreamingMode
+        switch expertStreamingMode {
+        case .pread:
+            effectiveStreamingMode = .pread(slotCount: runtime.expertCacheSlots)
+        case .mmap:
+            throw ServerRequestError.invalid(
+                message: "expert streaming mode mmap is not supported on this baseline",
+                param: "expert_streaming_mode",
+                code: "unsupported_value")
+        }
         let model = try Model.load(
             directoryURL: modelDirectory,
             device: context.device,
-            streamingMode: .pread(slotCount: runtime.expertCacheSlots),
+            streamingMode: effectiveStreamingMode,
             expertCachePolicy: runtime.modelExpertCachePolicy,
+            prefillExpertReadMode: runtime.prefillExpertReadMode,
+            prefillExpertLayerLocalReadaheadExperts: runtime.prefillExpertLayerLocalReadaheadExperts,
+            prefillExpertBoundedCoalescedRunExperts: runtime.prefillExpertBoundedCoalescedRunExperts,
+            prefillExpertBoundedParallelMissReadWorkers: runtime.prefillExpertBoundedParallelMissReadWorkers,
             integrityPolicy: .fullSha256)
         let runner = try RealForwardRunner(model: model,
                                            context: context,
@@ -198,6 +250,16 @@ public actor ServerModelSession: ServerInferenceBackend {
             runtime.prefillPolicy.rawValue,
             String(runtime.prefillChunkTokens),
             runtime.headPath.rawValue,
+            "expert_streaming=\(expertStreamingMode.rawValue)",
+            "pd_service=\(pdServiceMode.rawValue)",
+            "prompt_cache=\(promptCacheMode.rawValue)",
+            "prompt_cache_priming=\(promptCachePrimingMode.rawValue)",
+            "sticky_quota=\(stickyQuotaMode.rawValue)",
+            "diagnostics=\(diagnosticsMode.rawValue)",
+            "prefill_expert_read=\(prefillExpertReadMode.rawValue)",
+            "prefill_expert_readahead_experts=\(prefillExpertLayerLocalReadaheadExperts)",
+            "prefill_expert_bounded_run=\(prefillExpertBoundedCoalescedRunExperts)",
+            "prefill_expert_bounded_workers=\(prefillExpertBoundedParallelMissReadWorkers)",
         ].joined(separator: ":")
         let runtimeDigest = SHA256.hash(data: Data(runtimeIdentity.utf8))
             .map { String(format: "%02x", $0) }
@@ -210,6 +272,12 @@ public actor ServerModelSession: ServerInferenceBackend {
             kvStorage: PrefillKVStorageMode.fp16.rawValue,
             fp16RingEnabled: runtime.fp16RingEnabled,
             templateSHA256: templateDigest)
+        let prefillExpertTraceWriter: ServerPrefillExpertTraceWriter?
+        if let prefillExpertTraceOutput {
+            prefillExpertTraceWriter = try ServerPrefillExpertTraceWriter(path: prefillExpertTraceOutput)
+        } else {
+            prefillExpertTraceWriter = nil
+        }
         return ServerModelSession(context: context,
                                   model: model,
                                   tokenizer: tokenizer,
@@ -218,7 +286,9 @@ public actor ServerModelSession: ServerInferenceBackend {
                                   prefillConfig: runtime.prefillConfig,
                                   maxContext: maxContext,
                                   promptCacheMode: promptCacheMode,
-                                  promptCacheDomain: promptCacheDomain)
+                                  diagnosticsMode: diagnosticsMode,
+                                  promptCacheDomain: promptCacheDomain,
+                                  prefillExpertTraceWriter: prefillExpertTraceWriter)
     }
 
     private init(context: MetalContext,
@@ -229,7 +299,9 @@ public actor ServerModelSession: ServerInferenceBackend {
                  prefillConfig: PrefillRuntimeConfig,
                  maxContext: Int,
                  promptCacheMode: ServerPromptCacheMode,
-                 promptCacheDomain: ServerPromptCacheDomain) {
+                 diagnosticsMode: ServerDiagnosticsMode,
+                 promptCacheDomain: ServerPromptCacheDomain,
+                 prefillExpertTraceWriter: ServerPrefillExpertTraceWriter?) {
         self.context = context
         self.model = model
         self.tokenizer = tokenizer
@@ -238,7 +310,9 @@ public actor ServerModelSession: ServerInferenceBackend {
         self.prefillConfig = prefillConfig
         self.maxContext = maxContext
         self.promptCacheMode = promptCacheMode
+        self.diagnosticsMode = diagnosticsMode
         self.promptCacheDomain = promptCacheDomain
+        self.prefillExpertTraceWriter = prefillExpertTraceWriter
     }
 
     public func generate(
@@ -312,6 +386,9 @@ public actor ServerModelSession: ServerInferenceBackend {
         var calls: [ParsedToolCall] = []
         var decodingError: Error?
         var shouldStop = false
+        let prefillTimingBaseline = diagnosticsMode == .on
+            ? runner.prefillTimingBreakdownSnapshot
+            : .zero
 
         let result = try await runRawCompletion(
             producer: runner,
@@ -388,14 +465,40 @@ public actor ServerModelSession: ServerInferenceBackend {
                 stopStringFiltered: stopMatcher.isStopped)
         }
         completed = true
-        return ServerCompletion(
+          let prefillTimingBreakdown = diagnosticsMode == .on
+              ? runner.prefillTimingBreakdownSnapshot.delta(since: prefillTimingBaseline)
+              : nil
+          let prefillExpertAccessPattern = diagnosticsMode == .on
+              ? runner.prefillExpertAccessPatternSnapshot
+              : nil
+        let prefillExpertTrace = runner.prefillExpertTraceSnapshot
+        let completion = ServerCompletion(
             content: content,
             toolCalls: calls,
             finishReason: reason,
             usage: OpenAIUsage(promptTokens: result.prefillTokens,
                                completionTokens: result.newTokens,
                                totalTokens: result.prefillTokens + result.newTokens,
-                               cachedTokens: result.cachedPromptTokens))
+                               cachedTokens: result.cachedPromptTokens),
+            prefillMs: result.prefillSeconds * 1000.0,
+            decodeMs: result.decodeSeconds * 1000.0,
+                prefillTimingBreakdown: prefillTimingBreakdown,
+              prefillExpertAccessPattern: prefillExpertAccessPattern,
+            routedExpertCacheTelemetrySnapshots: diagnosticsMode == .on
+                ? result.routedExpertCacheTelemetrySnapshots
+                : [])
+        if let prefillExpertTraceWriter {
+            try await prefillExpertTraceWriter.append(
+                modelID: model.modelID,
+                sourceSnapshotHash: model.sourceSnapshotHash,
+                runtimeProfileHash: promptCacheDomain.runtimeProfileHash,
+                request: request,
+                renderedPromptIDs: promptIDs,
+                effectivePromptIDs: effectivePromptIDs,
+                completion: completion,
+                trace: prefillExpertTrace)
+        }
+        return completion
     }
 
     private func renderPrompt(_ request: ValidatedChatRequest) throws -> [Int32] {

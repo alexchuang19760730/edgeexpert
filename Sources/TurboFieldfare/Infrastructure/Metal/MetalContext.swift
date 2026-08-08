@@ -76,6 +76,7 @@ public final class MetalContext: @unchecked Sendable {
         "utility",
         "fused",
         "prefill",
+        "assistant",
     ]
 
     /// Bundle locations for runtime shader modules.
@@ -91,6 +92,7 @@ public final class MetalContext: @unchecked Sendable {
         "rope": "Metal/Primitives",
         "tensorops": "Metal/TensorCore",
         "utility": "Metal/Primitives",
+        "assistant": "Metal/Assistant",
     ]
 
     private static func shaderURL(module: String) -> URL? {
@@ -110,8 +112,8 @@ public final class MetalContext: @unchecked Sendable {
         }
         do {
             let opts = MTLCompileOptions()
-            // The MPP prefill path requires MSL 4.0 tensor operations.
-            opts.languageVersion = .version4_0
+            // Local CLT SDK tops out at MSL 3.2, so use the newest supported level here.
+            opts.languageVersion = .version3_2
             return try device.makeLibrary(source: combined, options: opts)
         } catch {
             throw MetalError.libraryCompileFailed("\(error)")
@@ -125,7 +127,7 @@ public final class MetalContext: @unchecked Sendable {
         }
         let src = try String(contentsOf: url, encoding: .utf8)
         let opts = MTLCompileOptions()
-        opts.languageVersion = .version4_0
+        opts.languageVersion = .version3_2
         do {
             return try device.makeLibrary(source: src, options: opts)
         } catch {

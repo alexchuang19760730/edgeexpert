@@ -4,8 +4,8 @@ import PackageDescription
 let package = Package(
     name: "TurboFieldfare",
     platforms: [
-        .macOS(.v26),
-        .iOS(.v26),
+        .macOS(.v15),
+        .iOS(.v18),
     ],
     products: [
         .library(name: "TurboFieldfare", targets: ["TurboFieldfare"]),
@@ -14,6 +14,7 @@ let package = Package(
         .executable(name: "TurboFieldfareMac", targets: ["TurboFieldfareMac"]),
         .executable(name: "TurboFieldfareDecodeService", targets: ["TurboFieldfareDecodeService"]),
         .executable(name: "TurboFieldfareServer", targets: ["TurboFieldfareServer"]),
+        .executable(name: "TurboFieldfareRebits", targets: ["TurboFieldfareRebits"]),
     ],
     dependencies: [
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.3.0"),
@@ -49,6 +50,11 @@ let package = Package(
             name: "TurboFieldfareCLI",
             dependencies: ["TurboFieldfareCLICore"],
             path: "Sources/TurboFieldfareCLI/Command"
+        ),
+        .executableTarget(
+            name: "TurboFieldfareRebits",
+            dependencies: ["TurboFieldfare"],
+            path: "Sources/TurboFieldfareRebits"
         ),
         .target(
             name: "TurboFieldfareAppCore",

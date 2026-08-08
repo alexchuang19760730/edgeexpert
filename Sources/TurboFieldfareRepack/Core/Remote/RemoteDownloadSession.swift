@@ -41,14 +41,16 @@ public final class RemoteDownloadSession: @unchecked Sendable {
         self.configuration = configuration
     }
 
-    public func response(for request: URLRequest) async throws -> (Data, URLResponse) {
+    public func response(for request: URLRequest,
+                         followRedirects: Bool = true) async throws -> (Data, URLResponse) {
         guard let configuration = configuration.copy() as? URLSessionConfiguration else {
             throw RepackError.configurationInvalid(detail:
                 "could not copy remote metadata session configuration")
         }
         let delegate = MetadataRedirectDelegate(
             originalRequest: request,
-            maximumRedirects: policy.maximumRedirects)
+            maximumRedirects: policy.maximumRedirects,
+            followRedirects: followRedirects)
         let session = URLSession(configuration: configuration,
                                  delegate: delegate,
                                  delegateQueue: nil)
@@ -98,10 +100,11 @@ private final class MetadataRedirectDelegate: NSObject, URLSessionTaskDelegate, 
     private let lock = NSLock()
     private var policy: RemoteMetadataRedirectPolicy
 
-    init(originalRequest: URLRequest, maximumRedirects: Int) {
+    init(originalRequest: URLRequest, maximumRedirects: Int, followRedirects: Bool) {
         self.policy = RemoteMetadataRedirectPolicy(
             originalRequest: originalRequest,
-            maximumRedirects: maximumRedirects)
+            maximumRedirects: maximumRedirects,
+            followRedirects: followRedirects)
     }
 
     func urlSession(_ session: URLSession,
@@ -119,19 +122,26 @@ private final class MetadataRedirectDelegate: NSObject, URLSessionTaskDelegate, 
 struct RemoteMetadataRedirectPolicy {
     private let sourceHost: String?
     private let originalMethod: String?
+    private let originalRange: String?
     private let originalAuthorization: String?
     private let maximumRedirects: Int
+    private let followRedirects: Bool
     private var redirectCount = 0
 
-    init(originalRequest: URLRequest, maximumRedirects: Int) {
+    init(originalRequest: URLRequest, maximumRedirects: Int, followRedirects: Bool) {
         self.sourceHost = originalRequest.url?.host?.lowercased()
         self.originalMethod = originalRequest.httpMethod
+        self.originalRange = originalRequest.value(forHTTPHeaderField: "Range")
         self.originalAuthorization = originalRequest.value(
             forHTTPHeaderField: "Authorization")
         self.maximumRedirects = maximumRedirects
+        self.followRedirects = followRedirects
     }
 
     mutating func request(proposedRequest: URLRequest) -> URLRequest? {
+        guard followRedirects else {
+            return nil
+        }
         redirectCount += 1
         guard redirectCount <= maximumRedirects,
               proposedRequest.url?.scheme?.lowercased() == "https",
@@ -140,6 +150,7 @@ struct RemoteMetadataRedirectPolicy {
         }
         var redirected = proposedRequest
         redirected.httpMethod = originalMethod
+        redirected.setValue(originalRange, forHTTPHeaderField: "Range")
         redirected.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
         redirected.setValue(
             originalAuthorization,

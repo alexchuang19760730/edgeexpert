@@ -334,6 +334,7 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
                 "finish_reason": completion.finishReason,
             ]],
             "usage": usageObject(completion.usage),
+            "diagnostics": diagnosticsObject(completion),
         ]
         writeJSON(context, status: .ok, object: object)
     }
@@ -410,6 +411,7 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
                 "model": modelID,
                 "choices": [],
                 "usage": usageObject(completion.usage),
+                "diagnostics": diagnosticsObject(completion),
             ])
         }
         let contextBox = SendableContext(context)
@@ -549,6 +551,227 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
             "total_tokens": usage.totalTokens,
             "prompt_tokens_details": [
                 "cached_tokens": usage.promptTokensDetails.cachedTokens,
+            ],
+        ]
+    }
+
+    private func diagnosticsObject(_ completion: ServerCompletion) -> [String: Any] {
+        let prefillBreakdownMs: [String: Any]? = completion.prefillTimingBreakdown.map { breakdown in
+            func ms(_ nanos: UInt64) -> Double {
+                Double(nanos) / 1_000_000.0
+            }
+            return [
+                "attention_ms": ms(breakdown.attentionNanos),
+                "router_front_half_gpu_ms": ms(breakdown.routerFrontHalfGPUNanos),
+                "router_readback_cpu_ms": ms(breakdown.routerReadbackAndCPUNanos),
+                "shared_expert_ms": ms(breakdown.sharedExpertNanos),
+                "streamed_routed_tiles_wait_ms": ms(breakdown.streamedRoutedTilesWaitNanos),
+                "tail_reduce_layer_tail_ms": ms(breakdown.tailReduceLayerTailNanos),
+                "prefill_tile_plan_ms": ms(breakdown.tilePlanNanos),
+                "prefill_tile_fetch_binding_ms": ms(breakdown.tileFetchBindingNanos),
+                "prefill_tile_argument_buffer_ms": ms(breakdown.tileArgumentBufferNanos),
+                "prefill_tile_fetch_open_or_read_ms": ms(breakdown.tileFetchOpenOrReadNanos),
+                "prefill_tile_fetch_read_wall_ms": ms(breakdown.tileFetchReadWallNanos),
+                "prefill_tile_fetch_cache_slot_overhead_ms": ms(breakdown.tileFetchCacheSlotOverheadNanos),
+            ]
+        }
+        let prefillExpertAccessPattern: [String: Any]? = completion.prefillExpertAccessPattern.map { pattern in
+            func ratio(_ numerator: UInt64, _ denominator: UInt64) -> Double? {
+                guard denominator > 0 else { return nil }
+                return Double(numerator) / Double(denominator)
+            }
+
+            let duplicateExpertReferences = pattern.expertReferences >= pattern.uniqueExperts
+                ? pattern.expertReferences - pattern.uniqueExperts
+                : 0
+            return [
+                "tile_accesses": pattern.tileAccesses,
+                "expert_references": pattern.expertReferences,
+                "unique_experts": pattern.uniqueExperts,
+                "duplicate_expert_references": duplicateExpertReferences,
+                "duplicate_reference_ratio": ratio(duplicateExpertReferences, pattern.expertReferences) as Any,
+                "mean_experts_per_tile": ratio(pattern.expertReferences, pattern.tileAccesses) as Any,
+                "consecutive_tile_comparisons": pattern.consecutiveTileComparisons,
+                "consecutive_tile_overlap_experts": pattern.consecutiveTileOverlapExperts,
+                "consecutive_tile_requested_experts": pattern.consecutiveTileRequestedExperts,
+                "consecutive_tile_overlap_ratio": ratio(pattern.consecutiveTileOverlapExperts,
+                                                         pattern.consecutiveTileRequestedExperts) as Any,
+                "contiguous_neighbor_pairs": pattern.contiguousNeighborPairs,
+                "contiguous_neighbor_opportunities": pattern.contiguousNeighborOpportunities,
+                "contiguous_neighbor_ratio": ratio(pattern.contiguousNeighborPairs,
+                                                    pattern.contiguousNeighborOpportunities) as Any,
+                "contiguous_run_count": pattern.contiguousRunCount,
+                "experts_in_contiguous_runs": pattern.expertsInContiguousRuns,
+                "max_contiguous_run_length": pattern.maxContiguousRunLength,
+            ]
+        }
+        let layers = completion.routedExpertCacheTelemetrySnapshots
+            .filter { layerSnapshot in
+                let stats = layerSnapshot.snapshot
+                return stats.totalPrefillRequests > 0
+                    || stats.totalDecodeRequests > 0
+                    || stats.totalSharedResidentRequests > 0
+                    || stats.totalEvictions > 0
+                    || stats.occupiedSlots > 0
+            }
+            .sorted { $0.layer < $1.layer }
+            .map { layerSnapshot in
+                let stats = layerSnapshot.snapshot
+                return [
+                    "layer": layerSnapshot.layer,
+                    "slot_count": stats.slotCount,
+                    "occupied_slots": stats.occupiedSlots,
+                    "cold_start_guard": stats.coldStartGuardActive,
+                    "decode_protected_cap": stats.effectiveDecodeProtectedCap,
+                    "decode_protected_budget": stats.effectiveDecodeProtectedLimit,
+                    "decode_protected_min_hits": stats.effectiveDecodeProtectedMinHitCount,
+                    "current_request_id": stats.currentRequestID as Any,
+                    "current_request_prefill_accesses": stats.currentRequestPrefillAccessCount,
+                    "current_request_decode_accesses": stats.currentRequestDecodeAccessCount,
+                    "current_request_shared_pool_accesses": stats.currentRequestSharedPoolAccessCount,
+                    "current_request_decode_step": stats.currentRequestDecodeStepIndex as Any,
+                    "current_request_delta": [
+                        "evictions": stats.currentRequestDelta.evictions,
+                        "prefill_transient_evictions": stats.currentRequestDelta.prefillTransientEvictions,
+                        "decode_protected_evictions": stats.currentRequestDelta.decodeProtectedEvictions,
+                        "shared_resident_evictions": stats.currentRequestDelta.sharedResidentEvictions,
+                        "decode_protected_promotions": stats.currentRequestDelta.decodeProtectedPromotions,
+                        "decode_protected_demotions": stats.currentRequestDelta.decodeProtectedDemotions,
+                        "decode_protected_admission_rejected":
+                            stats.currentRequestDelta.decodeProtectedAdmissionRejected,
+                        "prefill_shared_resident_promotions":
+                            stats.currentRequestDelta.prefillSharedResidentPromotions,
+                        "decode_shared_pool_handoff_requests":
+                            stats.currentRequestDelta.decodeSharedPoolHandoffRequests,
+                        "decode_shared_pool_handoff_hits":
+                            stats.currentRequestDelta.decodeSharedPoolHandoffHits,
+                        "decode_shared_pool_handoff_misses":
+                            stats.currentRequestDelta.decodeSharedPoolHandoffMisses,
+                    ],
+                    "current_request_focus_layer": stats.currentRequestFocusLayer,
+                    "current_request_raw_counter_steps": stats.currentRequestRawCounterSteps.map { step in
+                        [
+                            "decode_step_index": step.decodeStepIndex,
+                            "handoff_hits": step.handoffHits,
+                            "handoff_requests": step.handoffRequests,
+                            "plan_misses": step.planMisses,
+                            "read_wall_nanos": step.readWallNanos,
+                        ]
+                    },
+                    "decode_protected_slots": stats.decodeProtectedSlots,
+                    "prefill_transient_slots": stats.prefillTransientSlots,
+                    "shared_resident_slots": stats.sharedResidentSlots,
+                    "prefill_requests": stats.totalPrefillRequests,
+                    "prefill_hits": stats.totalPrefillHits,
+                    "prefill_misses": stats.totalPrefillMisses,
+                    "decode_requests": stats.totalDecodeRequests,
+                    "decode_hits": stats.totalDecodeHits,
+                    "decode_misses": stats.totalDecodeMisses,
+                    "shared_resident_requests": stats.totalSharedResidentRequests,
+                    "shared_resident_hits": stats.totalSharedResidentHits,
+                    "shared_resident_misses": stats.totalSharedResidentMisses,
+                    "total_loads": stats.totalLoads,
+                    "total_evictions": stats.totalEvictions,
+                    "prefill_transient_evictions": stats.totalPrefillTransientEvictions,
+                    "decode_protected_evictions": stats.totalDecodeProtectedEvictions,
+                    "decode_protected_promotions": stats.totalDecodeProtectedPromotions,
+                    "decode_protected_demotions": stats.totalDecodeProtectedDemotions,
+                    "decode_protected_admission_rejected": stats.totalDecodeProtectedAdmissionRejected,
+                    "shared_resident_evictions": stats.totalSharedResidentEvictions,
+                ] as [String: Any]
+            }
+        let aggregate: [String: Any] = [
+            "layers": layers.count,
+            "cold_start_guard_layers": layers.reduce(0) {
+                $0 + (((($1["cold_start_guard"] as? Bool) ?? false) ? 1 : 0))
+            },
+            "decode_protected_cap": layers.reduce(0) {
+                $0 + (Int(truncating: ($1["decode_protected_cap"] as? NSNumber) ?? 0))
+            },
+            "decode_protected_budget": layers.reduce(0) {
+                $0 + (Int(truncating: ($1["decode_protected_budget"] as? NSNumber) ?? 0))
+            },
+            "decode_protected_slots": layers.reduce(0) {
+                $0 + (Int(truncating: ($1["decode_protected_slots"] as? NSNumber) ?? 0))
+            },
+            "prefill_transient_slots": layers.reduce(0) {
+                $0 + (Int(truncating: ($1["prefill_transient_slots"] as? NSNumber) ?? 0))
+            },
+            "shared_resident_slots": layers.reduce(0) {
+                $0 + (Int(truncating: ($1["shared_resident_slots"] as? NSNumber) ?? 0))
+            },
+            "prefill_requests": layers.reduce(UInt64(0)) {
+                $0 + (UInt64(truncating: ($1["prefill_requests"] as? NSNumber) ?? 0))
+            },
+            "decode_requests": layers.reduce(UInt64(0)) {
+                $0 + (UInt64(truncating: ($1["decode_requests"] as? NSNumber) ?? 0))
+            },
+            "total_evictions": layers.reduce(UInt64(0)) {
+                $0 + (UInt64(truncating: ($1["total_evictions"] as? NSNumber) ?? 0))
+            },
+            "decode_protected_promotions": layers.reduce(UInt64(0)) {
+                $0 + (UInt64(truncating: ($1["decode_protected_promotions"] as? NSNumber) ?? 0))
+            },
+            "decode_protected_demotions": layers.reduce(UInt64(0)) {
+                $0 + (UInt64(truncating: ($1["decode_protected_demotions"] as? NSNumber) ?? 0))
+            },
+            "decode_protected_admission_rejected": layers.reduce(UInt64(0)) {
+                $0 + (UInt64(truncating: ($1["decode_protected_admission_rejected"] as? NSNumber) ?? 0))
+            },
+            "current_request_delta": [
+                "evictions": layers.reduce(UInt64(0)) {
+                    $0 + (UInt64(truncating: (($1["current_request_delta"] as? [String: Any])?["evictions"] as? NSNumber) ?? 0))
+                },
+                "prefill_transient_evictions": layers.reduce(UInt64(0)) {
+                    $0 + (UInt64(truncating: (($1["current_request_delta"] as? [String: Any])?["prefill_transient_evictions"] as? NSNumber) ?? 0))
+                },
+                "decode_protected_evictions": layers.reduce(UInt64(0)) {
+                    $0 + (UInt64(truncating: (($1["current_request_delta"] as? [String: Any])?["decode_protected_evictions"] as? NSNumber) ?? 0))
+                },
+                "shared_resident_evictions": layers.reduce(UInt64(0)) {
+                    $0 + (UInt64(truncating: (($1["current_request_delta"] as? [String: Any])?["shared_resident_evictions"] as? NSNumber) ?? 0))
+                },
+                "decode_protected_promotions": layers.reduce(UInt64(0)) {
+                    $0 + (UInt64(truncating: (($1["current_request_delta"] as? [String: Any])?["decode_protected_promotions"] as? NSNumber) ?? 0))
+                },
+                "decode_protected_demotions": layers.reduce(UInt64(0)) {
+                    $0 + (UInt64(truncating: (($1["current_request_delta"] as? [String: Any])?["decode_protected_demotions"] as? NSNumber) ?? 0))
+                },
+                "decode_protected_admission_rejected": layers.reduce(UInt64(0)) {
+                    $0 + (UInt64(truncating: (($1["current_request_delta"] as? [String: Any])?["decode_protected_admission_rejected"] as? NSNumber) ?? 0))
+                },
+                "prefill_shared_resident_promotions": layers.reduce(UInt64(0)) {
+                    $0 + (UInt64(truncating: (($1["current_request_delta"] as? [String: Any])?["prefill_shared_resident_promotions"] as? NSNumber) ?? 0))
+                },
+                "decode_shared_pool_handoff_requests": layers.reduce(UInt64(0)) {
+                    $0 + (UInt64(truncating: (($1["current_request_delta"] as? [String: Any])?["decode_shared_pool_handoff_requests"] as? NSNumber) ?? 0))
+                },
+                "decode_shared_pool_handoff_hits": layers.reduce(UInt64(0)) {
+                    $0 + (UInt64(truncating: (($1["current_request_delta"] as? [String: Any])?["decode_shared_pool_handoff_hits"] as? NSNumber) ?? 0))
+                },
+                "decode_shared_pool_handoff_misses": layers.reduce(UInt64(0)) {
+                    $0 + (UInt64(truncating: (($1["current_request_delta"] as? [String: Any])?["decode_shared_pool_handoff_misses"] as? NSNumber) ?? 0))
+                },
+            ],
+            "current_request_raw_counters": [
+                "focus_layers": layers.reduce(0) {
+                    $0 + (((($1["current_request_focus_layer"] as? Bool) ?? false) ? 1 : 0))
+                },
+                "tracked_steps": layers.reduce(0) {
+                    $0 + (((($1["current_request_raw_counter_steps"] as? [[String: Any]])?.count) ?? 0))
+                },
+            ],
+        ]
+        return [
+            "timing": [
+                "prefill_ms": completion.prefillMs,
+                "decode_ms": completion.decodeMs,
+                "prefill_breakdown_ms": prefillBreakdownMs as Any,
+            ],
+            "prefill_expert_access_pattern": prefillExpertAccessPattern as Any,
+            "routed_expert_cache": [
+                "aggregate": aggregate,
+                "layers": layers,
             ],
         ]
     }
