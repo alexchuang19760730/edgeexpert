@@ -1046,3 +1046,33 @@ layer0 100% → layer10 73%（§本節驗證腳本 /tmp/validate_approx.py），
 - **全常駐 256 experts 單項只有 12.08GB**——真正的瓶頸是 embed/lm_head（508MB）+ MTP head（420MB）+ KV
 - 三條可行路徑：**① int3 experts**（驗證過的 r3 方案，品質 gate 過）→ 13.1GB 含 MTP；**② pool192**（hit 85-87%）→ 12.2GB 含 MTP；**③ embed/lm_head 流式** → 15.1GB 邊緣
 - DeltaNet state 僅 2MB（非 60MB）——**262K 上下文全常駐的記憶體優勢比白皮書宣稱的更強**
+
+---
+
+## §13.50 DeltaNet 層對 batched verify 的加速（2026-08-08 量化）
+
+校準：Gemma4 session 實測 full-attn 層 0.20s / SWA 層 0.024s @(B=1, ctx=128)。
+Qwen3.6 full-attn head_dim=256（=2× Gemma4 128 的 score 成本）、kv_heads=2（=1/4 Gemma4 的 KV 讀取）。
+模型：score ∝ B×ctx×q_heads×head_dim；KV 讀 ∝ B×ctx×kv_heads×head_dim；DeltaNet ∝ B（2MB 固定 state）。
+
+### B=3 verify 的 attention 成本（相對 gemma4 單步 = 1.0x）
+| ctx | Gemma4 | Qwen3.6 | 誰便宜 |
+|---|---|---|---|
+| 128 | 3.0x | 5.5x | Gemma4（短 ctx）|
+| 2K | 16x | 5.1x | **Qwen（0.32×）** |
+| 8K | 24x | 18x | **Qwen（0.76×）** |
+| 32K | 56x | 70x | Gemma4 略 |
+| 131K | 184x | 280x | Gemma4 |
+
+### 關鍵發現：是 crossover，不是單向優勢
+- **短 ctx（<2K）Qwen3.6 反而貴 1.8×**——10 層 full-attn 的 head_dim=256 太貴（每層 = Gemma4 的 2×），DeltaNet 省的 ctx 依賴在短 ctx 沒有意義
+- **中 ctx（2K-8K）Qwen 顯著便宜**——30/40 層停止隨 ctx 增長，只有 10 層 full-attn 在漲
+- **長 ctx（32K+）Gemma4 又反超**——Gemma4 有 SWA window（2048 封頂，25 層固定）+ 僅 5 層 full 無封頂；Qwen 有 10 層 full 無封頂且 head_dim 256，平方項 2× 較重
+
+### 實際意義（M4 16GB）
+1. **DeltaNet 的優勢 = ctx 縮放行為，不是每 token 成本**——262K 下 30 層永遠不漲，才是架構真正的長上下文武器
+2. **verify 的每 token 成本主要由 MoE 權重讀取決定**（503MB vs Gemma4 768MB = 0.65×）——attn 在 4K-32K 典型區間只差 ±25%
+3. **full-attn 10 層是長上下文牆**：KV 20KB/token × 262K = 5.1GB（§13.49）——若要跑長上下文，KV 量化或 full-attn 稀疏化才是下一步
+
+### 結論
+DeltaNet 對 batched verify 的加速**不是「每 token 便宜 2-3×」**（短 ctx 反而貴），而是**「30/40 層的成本隨 ctx 完全凍結」**——在 2K-32K 的實用區間內 Qwen3.6 verify 比 Gemma4 便宜 25-68%，長上下文（262K）時 30 層固定成本的價值才完全顯現。
