@@ -960,3 +960,48 @@ decode 牆鐘的 3 組交錯 A/B 方向不穩（off 勝 17%、off 勝 9.6%、on 
 
 `decodeTensorOpsEnabled` 是 `environment["TURBO_FIELDFARE_ATTN_TENSOROPS"] != nil` —
 註解宣稱「opt-out with =0」但 `=0` 仍是存在即開。應改 `== "1"`。
+
+
+---
+
+## §13.48 Qwen3.6-35B-A3B routing trace（2026-08-08 實測）
+
+**方法**：streaming forward（真實權重：embedding + 32/40 層注意力 + router，分片 22/26 未完成故跳過層 32+），
+取 2 個 prompt（code 152 tok / prose 196 tok）收集每層 router 的 top-8 選擇。
+**近似驗證**：shared-expert-only 前向 vs exact top-8 expert FFN 的 routing 一致率
+layer0 100% → layer10 73%（§本節驗證腳本 /tmp/validate_approx.py），近似統計有效。
+
+### 熱集集中度（256 experts, top-8/層）
+| 指標 | code | prose |
+|---|---|---|
+| 使用到的 experts | 256/256 | 256/256 |
+| top-64 覆蓋 | 40.0% | 43.7% |
+| top-96 覆蓋 | 53.9% | 58.3% |
+| top-128 覆蓋 | 66.0% | 70.2% |
+| top-192 覆蓋 | 86.0% | 89.1% |
+| per-layer top-64 覆蓋（中位）| 80% | 90% |
+
+**關鍵結論：Qwen3.6 的 routing 遠比 Gemma4 平**——256 experts 全被使用、
+全局 pool 覆蓋率低（pool64 僅 ~40-44%，vs Gemma4 pool64 95%+）。
+且 **per-layer 熱集不同**（per-layer top-64 覆蓋 74-97%，但全局 top-64 pool 只有 40-44%）——
+同一個全局 pool 對不同層各自的最佳熱集只能命中一半。
+
+### decode 速度預估（503MB/token 未緩存、5.3GB/s、compute floor 26.3 tok/s）
+| pool | hit | missMB/tok | 預估 tok/s |
+|---|---|---|---|
+| 64 | 40-44% | 283-302 | ~10.5-11 |
+| 96 | 54-58% | 210-232 | ~12-13 |
+| 128 | 66-70% | 150-171 | ~14-15 |
+| 192 | 86-89% | 55-70 | ~19.5-20.7 |
+| 256（全常駐）| 100% | 0 | ~26（compute 天花板）|
+
+**白皮書 §1.2 的「503MB/token = Gemma4 的 0.65×」誤導**：原始未緩存 IO 確實較小，
+但 pool 命中率遠低於 Gemma4（routing 更平 + 層間熱集不同），**端側實測速度反而更依賴池大小**。
+
+### 對工程決策的影響
+- **pool64 只夠 Gemma4**；Qwen3.6 需要 pool≥128 才到 14-15 tok/s
+- **全常駐 256 experts 是質變**：僅 ~412MB int4（1.6MB×256），16GB 機完全可行，
+  且 MTP verify 的 expert 並集問題也消失（全常駐 = 零 miss）→ **Qwen3.6 上 MTP 有機會轉正**
+- 分片 22/26 下載完成後應重跑層 32-39 補全（腳本 /tmp/qwen36_route_trace.py）
+- trace 腳本與分析在 /tmp/qwen36_route_trace.py、/tmp/analyze_routes.py、/tmp/validate_approx.py
+
