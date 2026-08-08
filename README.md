@@ -380,3 +380,43 @@ it is the most beautiful thing you can do. And if you can, support your local
 wildlife community. They do important work.
 
 Thank you!
+---
+
+## Fork 改進（alexchuang19760730/edgeexpert）
+
+本 repo 是 [drumih/turbo-fieldfare](https://github.com/drumih/turbo-fieldfare) 的 fork，
+加上端側 MoE **expert streaming** 的完整優化（M4 16GB 實測），上游功能保持不變。
+
+### 新增能力
+
+| 項目 | 說明 |
+|---|---|
+| **Hot pool** | 高頻專家常駐（profile 驅動，sync/async 預載），IO 命中 ~97% |
+| **96-slot LRU + 平行 miss 讀取** | decode=8 workers、prefill cap 2；miss 成本隱藏進 GPU 窗口 |
+| **Wake polling** | Metal 完成處理器延遲從 ~330μs 降到 ~5μs |
+| **Per-tensor 位寬** | manifest 驅動的 attention/routed 分開位寬（2/3/4-bit），含 3-bit kernel |
+| **MTP draft assistant** | 官方 Gemma4 assistant head + adaptive gate（本硬體上已驗證為負收益 → 預設 off）|
+| **Rebits 工具** | `TurboFieldfareRebits`：由 base 模型產生 r2/r3 位寬變體 |
+
+### 端側實測（M4 16GB，Gemma4 26B-A4B，256 tok，乾淨窗）
+
+| 變體 | decode | TTFT |
+|---|---|---|
+| r2（2-bit）| **26.5 tok/s** | ~3s |
+| r3（3-bit）| **22.6 tok/s** | ~3.7s |
+| r4（4-bit）| **21.5 tok/s** | ~4.0s |
+
+生產啟動：`bin/run_prod.sh`（pool64-sync + 8 workers + trust-receipt + MTP off）。
+
+### 建置
+
+```bash
+export PATH="/opt/homebrew/opt/swift/bin:$PATH"   # Swift 6.2+
+swift build -c release
+```
+
+### 相關文件
+
+- 完整優化歷程與 A/B 決策：`TURBOFIELDFARE_MMAP_EXPERT_IO_PLAN_2026-08-07.md`
+  （位於 [cgcengine](https://github.com/alexchuang19760730/cgcengine) repo 根目錄）
+- runtime 環境變數：`docs/RUNTIME_CONTROLS.md`
