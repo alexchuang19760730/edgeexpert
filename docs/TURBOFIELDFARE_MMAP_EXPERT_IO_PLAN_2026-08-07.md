@@ -966,7 +966,7 @@ decode 牆鐘的 3 組交錯 A/B 方向不穩（off 勝 17%、off 勝 9.6%、on 
 
 ## §13.48 Qwen3.6-35B-A3B routing trace（2026-08-08 實測）
 
-**方法**：streaming forward（真實權重：embedding + 32/40 層注意力 + router，分片 22/26 未完成故跳過層 32+），
+**方法**：streaming forward（真實權重：embedding + 全部 40 層注意力 + router；分片 22/26 已於 2026-08-08 補齊後重跑完整 40 層），
 取 2 個 prompt（code 152 tok / prose 196 tok）收集每層 router 的 top-8 選擇。
 **近似驗證**：shared-expert-only 前向 vs exact top-8 expert FFN 的 routing 一致率
 layer0 100% → layer10 73%（§本節驗證腳本 /tmp/validate_approx.py），近似統計有效。
@@ -1005,3 +1005,44 @@ layer0 100% → layer10 73%（§本節驗證腳本 /tmp/validate_approx.py），
 - 分片 22/26 下載完成後應重跑層 32-39 補全（腳本 /tmp/qwen36_route_trace.py）
 - trace 腳本與分析在 /tmp/qwen36_route_trace.py、/tmp/analyze_routes.py、/tmp/validate_approx.py
 
+
+---
+
+## §13.49 Qwen3.6-35B-A3B 全常駐記憶體帳單（2026-08-08，int4 實測 shapes）
+
+### 權重（int4，含全部 26 分片下載完成後的真實 tensor shapes）
+| 項目 | 大小 |
+|---|---|
+| experts（256 × 30 層）| 12.08 GB |
+| shared experts | 47 MB |
+| full-attn dense（10 層）| 136 MB |
+| DeltaNet dense（30 層）| 503 MB |
+| router | 8 MB |
+| embed（248,320×2048）| 254 MB |
+| lm_head（未 tied）| 254 MB |
+| **主模型小計** | **13.28 GB** |
+| MTP head（fc + 1 層 decoder 含 256 experts）| 420 MB |
+| **權重總計** | **13.70 GB** |
+
+### Runtime
+| 項目 | 大小 |
+|---|---|
+| KV cache（bf16，10 層 full-attn，2 KV heads×256）| 20 KB/token（8K = 168 MB）|
+| DeltaNet state（32×128×128 fp32 + conv）| 2 MB（**非白皮書聲稱的 60MB**）|
+| activations（~200 tok 峰值）| ~200 MB |
+
+### 對照 16GB Mac
+| 方案 | 權重 | 總計（4K ctx）| 16GB 可行？ |
+|---|---|---|---|
+| **int4 全常駐 + MTP** | 13.70 | 16.1 GB | ❌ 超標（可用 ~13-14GB）|
+| int4 全常駐 − MTP | 13.28 | 15.6 GB | ⚠️ 邊緣（embed/lm_head 需流式）|
+| int4 全常駐，embed/lm_head 流式 | 12.77 | 15.1 GB | ⚠️ 邊緣 |
+| **int3 experts（同 r3 方案）+ MTP** | 10.7 | 13.1 GB | ✅ 可行 |
+| **pool192 + 流式其餘 + MTP** | 9.7 | 12.2 GB | ✅ 可行（pool192 hit 85-87%）|
+| int4 + MTP + KV int4 | 13.70 | 15.9 GB | ❌ 仍超標 |
+
+### 結論
+- 白皮書「13GB int4」低估（漏算 embed+lm_head 508MB 與 MTP head 420MB）；**真 int4 全常駐 = 13.7GB 權重 + runtime = 16.1GB，16GB Mac 裝不下**
+- **全常駐 256 experts 單項只有 12.08GB**——真正的瓶頸是 embed/lm_head（508MB）+ MTP head（420MB）+ KV
+- 三條可行路徑：**① int3 experts**（驗證過的 r3 方案，品質 gate 過）→ 13.1GB 含 MTP；**② pool192**（hit 85-87%）→ 12.2GB 含 MTP；**③ embed/lm_head 流式** → 15.1GB 邊緣
+- DeltaNet state 僅 2MB（非 60MB）——**262K 上下文全常駐的記憶體優勢比白皮書宣稱的更強**
